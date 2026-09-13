@@ -13,7 +13,6 @@ import numpy as np
 import tifffile as tiff
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 import yaml
 from skimage import io
@@ -22,16 +21,9 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 
-# Safety ceiling only; observed data are O(1--10) photons after scaling.
-_MAX_MU_LAMBDA = 1e12
-
-
 def _safe_mu_lambda(raw_mu_lambda):
-    """Positive, finite Gamma mean with a finite upper bound for NLL math."""
-    value = F.softplus(raw_mu_lambda)
-    return torch.nan_to_num(
-        value, nan=1e-12, posinf=_MAX_MU_LAMBDA, neginf=1e-12
-    ).clamp(min=1e-12, max=_MAX_MU_LAMBDA)
+    """Original identity-preserving positive Gamma mean mapping."""
+    return raw_mu_lambda.clamp_min(1e-12)
 
 from likelihood.dataset import (
     multibatch_test_save_srdtrans,
