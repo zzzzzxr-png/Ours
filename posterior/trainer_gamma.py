@@ -13,6 +13,7 @@ import numpy as np
 import tifffile as tiff
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 import yaml
 from skimage import io
@@ -405,7 +406,7 @@ class training_class_srdtrans_gamma:
             1, 1, self.patch_t, self.patch_y, self.patch_x, device=device
         ) + 0.1 * self.rank
         candidates = self.local_model(x)
-        mu_lambda = ((candidates + 5000.0) / 5000.0).clamp_min(1e-12)
+        mu_lambda = F.softplus((candidates + 5000.0) / 5000.0)
         a, b = gamma_ab_from_mu_kappa(
             mu_lambda, torch.full_like(mu_lambda, float(self.mpgn_kappa))
         )
@@ -680,9 +681,8 @@ class training_class_srdtrans_gamma:
                                     dim=(0, 2, 3, 4), dtype=torch.float64
                                 ).detach()
                                 clamp_total += float(mu_phys[:, 0].numel())
-                                mu_lambda = torch.clamp(
-                                    (mu_phys - float(self.mpgn_offset)) / float(self.mpgn_alpha),
-                                    min=1e-12,
+                                mu_lambda = F.softplus(
+                                    (mu_phys - float(self.mpgn_offset)) / float(self.mpgn_alpha)
                                 )
                                 kappa = torch.full_like(mu_lambda, float(self.mpgn_kappa))
                                 a, b = gamma_ab_from_mu_kappa(mu_lambda, kappa)
@@ -1016,7 +1016,7 @@ class training_class_srdtrans_gamma:
                 y_phys = noise_patch + img_mean_t
                 mu_phys = mu_centered + img_mean_t
                 mu_lambda = (mu_phys - offset_t) / alpha_t
-                mu_lambda = torch.clamp(mu_lambda, min=1e-12)
+                mu_lambda = F.softplus(mu_lambda)
                 kappa_t = torch.full_like(mu_lambda, kappa)
                 a, b = gamma_ab_from_mu_kappa(mu_lambda, kappa_t)
                 posterior_kwargs = dict(
