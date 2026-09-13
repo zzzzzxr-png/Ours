@@ -23,7 +23,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 
 # Safety ceiling only; observed data are O(1--10) photons after scaling.
-_MAX_MU_LAMBDA = 1e8
+_MAX_MU_LAMBDA = 1e12
 
 
 def _safe_mu_lambda(raw_mu_lambda):
