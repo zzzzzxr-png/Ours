@@ -188,6 +188,8 @@ def parse_args():
 
     parser.add_argument('--eval_every_iters', type=int, default=0,
                         help='Validate every N iterations (0 = end of epoch only)')
+    parser.add_argument('--debug_every_steps', type=int, default=50,
+                        help='Print masked Gamma/gradient diagnostics every N steps (0 disables).')
     parser.add_argument('--checkpoint-every-epochs', type=int, default=5,
                         help='Save a periodic checkpoint every N epochs')
     parser.add_argument('--validation-every-epochs', type=int, default=1,

@@ -25,6 +25,36 @@ def _safe_mu_lambda(raw_mu_lambda):
     """Original identity-preserving positive Gamma mean mapping."""
     return raw_mu_lambda.clamp_min(1e-12)
 
+
+def _grad_norm(tensor):
+    return 0.0 if tensor is None or tensor.grad is None else float(tensor.grad.detach().norm().item())
+
+
+def _complex_debug(model, raw_mu_lambda, structured, mask):
+    """Compact finite/scale/gradient diagnostics for one masked batch."""
+    valid = mask[:, 0].bool()
+    lines = []
+    for i, name in enumerate(('x', 'y', 't')):
+        v = raw_mu_lambda[:, i][valid]
+        if v.numel():
+            q = torch.quantile(v.detach().float(), torch.tensor([0.001, .01, .05, .5], device=v.device))
+            bins = [(v <= 0).sum(), ((v > 0) & (v < 1e-6)).sum(), ((v >= 1e-6) & (v < 1e-4)).sum(), ((v >= 1e-4) & (v < 1e-2)).sum()]
+            lines.append('{} min={:.3g} p={:.3g}/{:.3g}/{:.3g} med={:.3g} bins={}'.format(name, float(v.min()), *[float(x) for x in q], [int(x) for x in bins]))
+    lines.append('max_uc/vx/vy/vt={:.3g}/{:.3g}/{:.3g}/{:.3g}'.format(*[float(v.detach()) for v in (structured.real.abs().amax(), structured[:, 0].imag.abs().amax(), structured[:, 1].imag.abs().amax(), structured[:, 2].imag.abs().amax())]))
+    base = _unwrap_model(model)
+    pr = getattr(base, 'physical_readout', None)
+    physical_g = _grad_norm(getattr(pr, 'weight', None))
+    complex_g = 0.0
+    modrelu_g = 0.0
+    for module in base.modules():
+        if 'ComplexConv' in module.__class__.__name__:
+            complex_g = _grad_norm(getattr(module, 'weight', None)) or complex_g
+        if 'modrelu' in module.__class__.__name__.lower() or 'modrelu' in str(module).lower():
+            for p in module.parameters():
+                modrelu_g = max(modrelu_g, _grad_norm(p))
+    lines.append('grad physical/last_complex/modReLU={:.3g}/{:.3g}/{:.3g}'.format(physical_g, complex_g, modrelu_g))
+    return ' | '.join(lines)
+
 from likelihood.dataset import (
     multibatch_test_save_srdtrans,
     singlebatch_test_save_srdtrans,
@@ -177,6 +207,7 @@ class training_class_srdtrans_gamma:
         self.no_resume = False
         self.eval_val_per_epoch = True
         self.eval_every_iters = 0
+        self.debug_every_steps = 50
         self.val_process_frames = 400
         self.snr_margin = 50
         self.save_test_images_per_epoch = True
@@ -349,7 +380,7 @@ class training_class_srdtrans_gamma:
             'batch_size', 'patch_x', 'patch_y', 'patch_t', 'gap_y', 'gap_x', 'gap_t',
             'lr', 'b1', 'b2', 'fmap', 'select_img_num',
             'train_datasets_size', 'overlap_factor', 'val_overlap_factor',
-            'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'backbone',
+            'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'debug_every_steps', 'backbone',
             'checkpoint_every_epochs', 'validation_every_epochs',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate', 'srdtrans_f_maps', 'input_dropout_rate',
@@ -561,6 +592,10 @@ class training_class_srdtrans_gamma:
                 global_iter = start_epoch * len(trainloader)
 
             for iteration, batch in enumerate(trainloader):
+                debug_now = (getattr(self, 'debug_every_steps', 0) > 0
+                             and (global_iter + 1) % int(self.debug_every_steps) == 0)
+                debug_structured = None
+                debug_raw_mu = None
                 if self.sampling_mode == 'temporal':
                     inp, tgt = batch
                     if cuda:
@@ -654,7 +689,10 @@ class training_class_srdtrans_gamma:
                                 )
                             )
 
-                        noisy_output = self.local_model(masked_input)
+                        if debug_now and hasattr(_unwrap_model(self.local_model), 'forward_with_complex'):
+                            noisy_output, debug_structured = self.local_model(masked_input, return_complex=True)
+                        else:
+                            noisy_output = self.local_model(masked_input)
                         if getattr(self, 'mask_loss', 'l1l2') == 'nll':
                             patch_mean = stack_global_mean.view(-1, 1, 1, 1, 1)
                             if noisy_output.shape[1] == 1:
@@ -685,8 +723,9 @@ class training_class_srdtrans_gamma:
                                     dim=(0, 2, 3, 4), dtype=torch.float64
                                 ).detach()
                                 clamp_total += float(mu_phys[:, 0].numel())
+                                debug_raw_mu = (mu_phys - float(self.mpgn_offset)) / float(self.mpgn_alpha)
                                 mu_lambda = _safe_mu_lambda(
-                                    (mu_phys - float(self.mpgn_offset)) / float(self.mpgn_alpha)
+                                    debug_raw_mu
                                 )
                                 kappa = torch.full_like(mu_lambda, float(self.mpgn_kappa))
                                 a, b = gamma_ab_from_mu_kappa(mu_lambda, kappa)
@@ -730,6 +769,16 @@ class training_class_srdtrans_gamma:
 
                 optimizer_G.zero_grad()
                 total_loss.backward()
+                if self.distributed:
+                    global_loss = total_loss.detach().clone()
+                    dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
+                    global_loss /= self.world_size
+                else:
+                    global_loss = total_loss.detach()
+                if debug_now and debug_structured is not None and debug_raw_mu is not None:
+                    debug_text = _complex_debug(self.local_model, debug_raw_mu, debug_structured, loss_mask)
+                    if self.is_main_process:
+                        print('\n[debug step {}] {} | global_loss={:.5f}'.format(global_iter + 1, debug_text, float(global_loss)))
                 optimizer_G.step()
                 global_iter += 1
 
@@ -747,7 +796,7 @@ class training_class_srdtrans_gamma:
                             self.n_epochs,
                             iteration + 1,
                             len(trainloader),
-                            total_loss.item(),
+                            global_loss.item(),
                             time_left,
                             time.time() - time_start,
                         ),
