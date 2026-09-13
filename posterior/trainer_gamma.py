@@ -22,8 +22,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 
 def _safe_mu_lambda(raw_mu_lambda):
-    """Identity-preserving Gamma mean mapping with an extreme-value guard."""
-    return raw_mu_lambda.clamp(min=1e-12, max=1e12)
+    """Original identity-preserving positive Gamma mean mapping."""
+    return raw_mu_lambda.clamp_min(1e-12)
 
 from likelihood.dataset import (
     multibatch_test_save_srdtrans,
