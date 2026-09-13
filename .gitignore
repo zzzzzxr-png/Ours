@@ -1,0 +1,24 @@
+# Training outputs and large generated artifacts
+experiments/
+logs/
+results/
+*.pth
+*.pt
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Local editor/system files
+.DS_Store
+.vscode/
+.idea/

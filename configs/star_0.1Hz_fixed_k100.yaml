@@ -1,0 +1,11 @@
+GPU: '0'
+datasets_path: /data/zhouxirou/All_Datasets/dataset_CI_syn_Q004_a5000_b1600/dataset_zxr_all_frequency_Q004_beta1600-1-T1000H245W245/0.1Hz/0.1Hz_Noisy
+gt_path: /data/zhouxirou/All_Datasets/dataset_CI_syn_Q004_a5000_b1600/dataset_zxr_all_frequency_Q004_beta1600-1-T1000H245W245/0.1Hz/0.1Hz_GT/clean_0.1Hz_1000frames.tif
+sampling_mode: height_mask
+mask_ratio: 0.05
+mask_min_dist: 2
+kappa_mode: fixed
+mpgn_kappa: 100.0
+checkpoint_every_epochs: 5
+validation_every_epochs: 1
+trans_order: st
