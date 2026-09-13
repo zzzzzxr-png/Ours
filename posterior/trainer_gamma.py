@@ -548,6 +548,10 @@ class training_class_srdtrans_gamma:
                 generator=loader_generator,
                 worker_init_fn=worker_init_fn,
             )
+            # Diagnostic for the clamp's zero-gradient region (per candidate).
+            metric_device = next(self.local_model.parameters()).device
+            clamp_hits = torch.zeros(3, device=metric_device, dtype=torch.float64)
+            clamp_total = torch.zeros(3, device=metric_device, dtype=torch.float64)
             if epoch == start_epoch and start_epoch > 0:
                 global_iter = start_epoch * len(trainloader)
 
@@ -672,6 +676,10 @@ class training_class_srdtrans_gamma:
                                 )
                             else:
                                 mu_phys = noisy_output + patch_mean
+                                clamp_hits += (mu_phys <= float(self.mpgn_offset)).sum(
+                                    dim=(0, 2, 3, 4), dtype=torch.float64
+                                ).detach()
+                                clamp_total += float(mu_phys[:, 0].numel())
                                 mu_lambda = torch.clamp(
                                     (mu_phys - float(self.mpgn_offset)) / float(self.mpgn_alpha),
                                     min=1e-12,
@@ -781,6 +789,16 @@ class training_class_srdtrans_gamma:
                     if self.is_main_process:
                         self.local_model.train()
                         print('\n', end=' ')
+
+            if self.distributed:
+                dist.all_reduce(clamp_hits, op=dist.ReduceOp.SUM)
+                dist.all_reduce(clamp_total, op=dist.ReduceOp.SUM)
+            if self.is_main_process and clamp_total.sum().item() > 0:
+                ratios = (clamp_hits / clamp_total.clamp_min(1)).tolist()
+                print(
+                    'Clamp ratio (mu_phys <= offset) x/y/t: '
+                    '{:.3%}/{:.3%}/{:.3%}'.format(*ratios)
+                )
 
     def save_model(self, epoch, iteration):
         os.makedirs(self.pth_path, exist_ok=True)
