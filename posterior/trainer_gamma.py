@@ -21,6 +21,17 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+
+_MAX_MU_LAMBDA = 1e4
+
+
+def _safe_mu_lambda(raw_mu_lambda):
+    """Positive, finite Gamma mean with a finite upper bound for NLL math."""
+    value = F.softplus(raw_mu_lambda)
+    return torch.nan_to_num(
+        value, nan=1e-12, posinf=_MAX_MU_LAMBDA, neginf=1e-12
+    ).clamp(min=1e-12, max=_MAX_MU_LAMBDA)
+
 from likelihood.dataset import (
     multibatch_test_save_srdtrans,
     singlebatch_test_save_srdtrans,
@@ -406,7 +417,7 @@ class training_class_srdtrans_gamma:
             1, 1, self.patch_t, self.patch_y, self.patch_x, device=device
         ) + 0.1 * self.rank
         candidates = self.local_model(x)
-        mu_lambda = F.softplus((candidates + 5000.0) / 5000.0)
+        mu_lambda = _safe_mu_lambda((candidates + 5000.0) / 5000.0)
         a, b = gamma_ab_from_mu_kappa(
             mu_lambda, torch.full_like(mu_lambda, float(self.mpgn_kappa))
         )
@@ -681,7 +692,7 @@ class training_class_srdtrans_gamma:
                                     dim=(0, 2, 3, 4), dtype=torch.float64
                                 ).detach()
                                 clamp_total += float(mu_phys[:, 0].numel())
-                                mu_lambda = F.softplus(
+                                mu_lambda = _safe_mu_lambda(
                                     (mu_phys - float(self.mpgn_offset)) / float(self.mpgn_alpha)
                                 )
                                 kappa = torch.full_like(mu_lambda, float(self.mpgn_kappa))
@@ -1016,7 +1027,7 @@ class training_class_srdtrans_gamma:
                 y_phys = noise_patch + img_mean_t
                 mu_phys = mu_centered + img_mean_t
                 mu_lambda = (mu_phys - offset_t) / alpha_t
-                mu_lambda = F.softplus(mu_lambda)
+                mu_lambda = _safe_mu_lambda(mu_lambda)
                 kappa_t = torch.full_like(mu_lambda, kappa)
                 a, b = gamma_ab_from_mu_kappa(mu_lambda, kappa_t)
                 posterior_kwargs = dict(
