@@ -54,6 +54,7 @@ class AnalyticComplexBackbone(nn.Module):
     def __init__(self, backbone: nn.Module):
         super().__init__()
         self.backbone = backbone
+        self.physical_readout = nn.Conv3d(6, 4, kernel_size=1)
 
     def forward_with_complex(self, x):
         if x.ndim != 5 or x.shape[1] != 1 or x.is_complex():
@@ -70,11 +71,13 @@ class AnalyticComplexBackbone(nn.Module):
                     tuple(latent_complex.shape), latent_complex.dtype
                 )
             )
-        shared_real = latent_complex.real.mean(dim=1, keepdim=True)
+        latent_real = torch.cat([latent_complex.real, latent_complex.imag], dim=1)
+        physical = self.physical_readout(latent_real)
+        shared_real = physical[:, 0:1]
         structured_output = torch.cat(
             [
-                torch.complex(shared_real, latent_complex.imag[:, index:index + 1])
-                for index in range(3)
+                torch.complex(shared_real, physical[:, index:index + 1])
+                for index in range(1, 4)
             ],
             dim=1,
         )
