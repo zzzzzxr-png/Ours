@@ -37,9 +37,10 @@ def _complex_debug(model, raw_mu_lambda, structured, mask):
     for i, name in enumerate(('x', 'y', 't')):
         v = raw_mu_lambda[:, i][valid]
         if v.numel():
-            q = torch.quantile(v.detach().float(), torch.tensor([0.001, .01, .05, .5], device=v.device))
+            v_detached = v.detach()
+            q = torch.quantile(v_detached.float(), torch.tensor([0.001, .01, .05, .5], device=v.device))
             bins = [(v <= 0).sum(), ((v > 0) & (v < 1e-6)).sum(), ((v >= 1e-6) & (v < 1e-4)).sum(), ((v >= 1e-4) & (v < 1e-2)).sum()]
-            lines.append('{} min={:.3g} p={:.3g}/{:.3g}/{:.3g} med={:.3g} bins={}'.format(name, float(v.min()), *[float(x) for x in q], [int(x) for x in bins]))
+            lines.append('{} min={:.3g} p={:.3g}/{:.3g}/{:.3g} med={:.3g} bins={}'.format(name, float(v_detached.min()), *[float(x) for x in q], [int(x) for x in bins]))
     lines.append('max_uc/vx/vy/vt={:.3g}/{:.3g}/{:.3g}/{:.3g}'.format(*[float(v.detach()) for v in (structured.real.abs().amax(), structured[:, 0].imag.abs().amax(), structured[:, 1].imag.abs().amax(), structured[:, 2].imag.abs().amax())]))
     base = _unwrap_model(model)
     pr = getattr(base, 'physical_readout', None)
@@ -48,7 +49,8 @@ def _complex_debug(model, raw_mu_lambda, structured, mask):
     modrelu_g = 0.0
     for module in base.modules():
         if 'ComplexConv' in module.__class__.__name__:
-            complex_g = _grad_norm(getattr(module, 'weight', None)) or complex_g
+            module_g = max((_grad_norm(p) for p in module.parameters()), default=0.0)
+            complex_g = module_g or complex_g
         if 'modrelu' in module.__class__.__name__.lower() or 'modrelu' in str(module).lower():
             for p in module.parameters():
                 modrelu_g = max(modrelu_g, _grad_norm(p))
