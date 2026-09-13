@@ -59,6 +59,30 @@ def _complex_debug(model, raw_mu_lambda, structured, mask):
     lines.append('grad physical/last_complex/modReLU={:.3g}/{:.3g}/{:.3g}'.format(physical_g, complex_g, modrelu_g))
     return ' | '.join(lines)
 
+
+@torch.no_grad()
+def _fixed_patch_debug(model, patch, mode, mask_ratio, mask_min_dist):
+    """Compare one fixed validation patch with and without training masking."""
+    model.eval()
+    full = model(patch)
+    masked_input, _, mask = make_directional_mask_pair(
+        patch, mode=mode, mask_ratio=mask_ratio, min_dist=mask_min_dist,
+        lattice_random_phase=False,
+    )
+    masked = model(masked_input)
+    valid = mask[:, 0].bool()
+
+    def summary(x, selector=None):
+        y = x if selector is None else x[selector]
+        vals = []
+        for i in range(3):
+            z = (x[:, i][valid] if selector is None else y[:, i][valid])
+            vals.append('{:.3g}/{:.3g}/{:.3g}'.format(
+                float(z.mean()), float(z.min()), float(torch.quantile(z.float(), torch.tensor(.01, device=z.device)))))
+        return ','.join(vals)
+
+    return 'fixed_val unmasked(mean/min/p1)={} masked={}'.format(summary(full), summary(masked))
+
 from likelihood.dataset import (
     multibatch_test_save_srdtrans,
     singlebatch_test_save_srdtrans,
@@ -600,6 +624,7 @@ class training_class_srdtrans_gamma:
                              and (global_iter + 1) % int(self.debug_every_steps) == 0)
                 debug_structured = None
                 debug_raw_mu = None
+                a = b = None
                 if self.sampling_mode == 'temporal':
                     inp, tgt = batch
                     if cuda:
@@ -781,6 +806,30 @@ class training_class_srdtrans_gamma:
                     global_loss = total_loss.detach()
                 if debug_now and debug_structured is not None and debug_raw_mu is not None:
                     debug_text = _complex_debug(self.local_model, debug_raw_mu, debug_structured, loss_mask)
+                    responsibility_text = ''
+                    if a is not None and b is not None:
+                        resp_result = gamma_mixture_nb_predictive_and_posterior(
+                            a.detach(), b.detach(), masked_target.detach() + patch_mean.detach(),
+                            alpha=self.mpgn_alpha, beta=self.mpgn_beta,
+                            offset=self.mpgn_offset, valid_mask=loss_mask,
+                            kmax=int(self.mpgn_kmax), chunk_t=int(self.mpgn_nll_chunk_t),
+                            tail_tol=float(self.mpgn_k_tail_tol),
+                        )
+                        resp = resp_result['component_responsibility']
+                        responsibility_text = ' responsibility=' + '/'.join(
+                            '{:.4f}'.format(float(resp[:, i][loss_mask[:, 0].bool()].mean()))
+                            for i in range(3)
+                        )
+                    if not self._eval_cache_ready:
+                        self._prepare_eval_cache()
+                    val_patch = torch.from_numpy(
+                        self._eval_noise_img[:self.patch_t, :self.patch_y, :self.patch_x]
+                    ).float().unsqueeze(0).unsqueeze(0).to(next(self.local_model.parameters()).device)
+                    debug_text += ' | ' + _fixed_patch_debug(
+                        self.local_model, val_patch, self.sampling_mode,
+                        self.mask_ratio, self.mask_min_dist,
+                    ) + responsibility_text
+                    self.local_model.train()
                     if self.is_main_process:
                         print('\n[debug step {}] {} | global_loss={:.5f}'.format(global_iter + 1, debug_text, float(global_loss)))
                 optimizer_G.step()
