@@ -48,7 +48,9 @@ def _complex_debug(model, raw_mu_lambda, structured, mask):
     complex_g = 0.0
     modrelu_g = 0.0
     for module in base.modules():
-        if 'ComplexConv' in module.__class__.__name__:
+        if ('ComplexConv' in module.__class__.__name__
+                or (module.__class__.__name__ == 'Conv3d'
+                    and module.__class__.__module__.startswith('complextorch'))):
             module_g = max((_grad_norm(p) for p in module.parameters()), default=0.0)
             complex_g = module_g or complex_g
         if 'modrelu' in module.__class__.__name__.lower() or 'modrelu' in str(module).lower():
