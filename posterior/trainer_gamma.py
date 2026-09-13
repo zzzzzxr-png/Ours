@@ -42,6 +42,18 @@ def _complex_debug(model, raw_mu_lambda, structured, mask):
             bins = [(v <= 0).sum(), ((v > 0) & (v < 1e-6)).sum(), ((v >= 1e-6) & (v < 1e-4)).sum(), ((v >= 1e-4) & (v < 1e-2)).sum()]
             lines.append('{} min={:.3g} p={:.3g}/{:.3g}/{:.3g} med={:.3g} bins={}'.format(name, float(v_detached.min()), *[float(x) for x in q], [int(x) for x in bins]))
     lines.append('max_uc/vx/vy/vt={:.3g}/{:.3g}/{:.3g}/{:.3g}'.format(*[float(v.detach()) for v in (structured.real.abs().amax(), structured[:, 0].imag.abs().amax(), structured[:, 1].imag.abs().amax(), structured[:, 2].imag.abs().amax())]))
+    residual_parts = []
+    for i, direction in enumerate(('x', 'y', 't')):
+        z = structured[:, i:i + 1].detach()
+        projected = analytic_projection(z, direction)
+        residual = z - projected
+        z_norm = z.abs().square().sum().sqrt().clamp_min(1e-12)
+        residual_parts.append('{:.3g}/{:.3g}/{:.3g}'.format(
+            float(residual.abs().square().mean().sqrt()),
+            float(residual.abs().amax()),
+            float(residual.abs().square().sum().sqrt() / z_norm),
+        ))
+    lines.append('residual_rms/max/rho(x/y/t)=' + ';'.join(residual_parts))
     base = _unwrap_model(model)
     pr = getattr(base, 'physical_readout', None)
     physical_g = _grad_norm(getattr(pr, 'weight', None))
@@ -125,7 +137,7 @@ from posterior.dual_context_prior import (
     dual_axis_context_prior,
     dual_axis_from_sampling_mode,
 )
-from posterior.analytic_representation import quadrature_contribution
+from posterior.analytic_representation import analytic_projection, quadrature_contribution
 
 
 _PARALLEL_TYPES = (nn.DataParallel, DistributedDataParallel)
