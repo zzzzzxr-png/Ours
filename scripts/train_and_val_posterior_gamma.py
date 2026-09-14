@@ -84,6 +84,10 @@ def parse_args():
                         ],
                         help='Denoise backbone (all external backbones use 1ch, '
                              'trained from scratch under SRD protocol)')
+    parser.add_argument('--representation', type=str, default='dtcwt', choices=['dtcwt'])
+    parser.add_argument('--dtcwt_dim', type=int, default=2, choices=[2, 3])
+    parser.add_argument('--dtcwt_levels', type=int, default=3)
+    parser.add_argument('--dtcwt_embed_channels', type=int, default=8)
     parser.add_argument('--fmap', type=int, default=16,
                         help='3D U-Net feature maps (ignored for transformer backbones)')
     parser.add_argument('--srdtrans-root', type=str, default=DEFAULT_SRDTRANS_ROOT,
@@ -188,8 +192,6 @@ def parse_args():
 
     parser.add_argument('--eval_every_iters', type=int, default=0,
                         help='Validate every N iterations (0 = end of epoch only)')
-    parser.add_argument('--debug_every_steps', type=int, default=50,
-                        help='Print masked Gamma/gradient diagnostics every N steps (0 disables).')
     parser.add_argument('--checkpoint-every-epochs', type=int, default=5,
                         help='Save a periodic checkpoint every N epochs')
     parser.add_argument('--validation-every-epochs', type=int, default=1,
@@ -277,6 +279,10 @@ def main():
         'slice_axis': args.slice_axis,
         'fmap': args.fmap,
         'backbone': args.backbone,
+        'representation': args.representation,
+        'dtcwt_dim': args.dtcwt_dim,
+        'dtcwt_levels': args.dtcwt_levels,
+        'dtcwt_embed_channels': args.dtcwt_embed_channels,
         'srdtrans_root': args.srdtrans_root,
         'embedding_dim': args.embedding_dim,
         'num_heads': args.num_heads,

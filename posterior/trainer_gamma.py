@@ -26,75 +26,6 @@ def _safe_mu_lambda(raw_mu_lambda):
     return raw_mu_lambda.clamp_min(1e-12)
 
 
-def _grad_norm(tensor):
-    return 0.0 if tensor is None or tensor.grad is None else float(tensor.grad.detach().norm().item())
-
-
-def _complex_debug(model, raw_mu_lambda, structured, mask):
-    """Compact finite/scale/gradient diagnostics for one masked batch."""
-    valid = mask[:, 0].bool()
-    lines = []
-    for i, name in enumerate(('x', 'y', 't')):
-        v = raw_mu_lambda[:, i][valid]
-        if v.numel():
-            v_detached = v.detach()
-            q = torch.quantile(v_detached.float(), torch.tensor([0.001, .01, .05, .5], device=v.device))
-            bins = [(v <= 0).sum(), ((v > 0) & (v < 1e-6)).sum(), ((v >= 1e-6) & (v < 1e-4)).sum(), ((v >= 1e-4) & (v < 1e-2)).sum()]
-            lines.append('{} min={:.3g} p={:.3g}/{:.3g}/{:.3g} med={:.3g} bins={}'.format(name, float(v_detached.min()), *[float(x) for x in q], [int(x) for x in bins]))
-    lines.append('max_uc/vx/vy/vt={:.3g}/{:.3g}/{:.3g}/{:.3g}'.format(*[float(v.detach()) for v in (structured.real.abs().amax(), structured[:, 0].imag.abs().amax(), structured[:, 1].imag.abs().amax(), structured[:, 2].imag.abs().amax())]))
-    residual_parts = []
-    for i, direction in enumerate(('x', 'y', 't')):
-        z = structured[:, i:i + 1].detach()
-        projected = analytic_projection(z, direction)
-        residual = z - projected
-        z_norm = z.abs().square().sum().sqrt().clamp_min(1e-12)
-        residual_parts.append('{:.3g}/{:.3g}/{:.3g}'.format(
-            float(residual.abs().square().mean().sqrt()),
-            float(residual.abs().amax()),
-            float(residual.abs().square().sum().sqrt() / z_norm),
-        ))
-    lines.append('residual_rms/max/rho(x/y/t)=' + ';'.join(residual_parts))
-    base = _unwrap_model(model)
-    pr = getattr(base, 'physical_readout', None)
-    physical_g = _grad_norm(getattr(pr, 'weight', None))
-    complex_g = 0.0
-    modrelu_g = 0.0
-    for module in base.modules():
-        if ('ComplexConv' in module.__class__.__name__
-                or (module.__class__.__name__ == 'Conv3d'
-                    and module.__class__.__module__.startswith('complextorch'))):
-            module_g = max((_grad_norm(p) for p in module.parameters()), default=0.0)
-            complex_g = module_g or complex_g
-        if 'modrelu' in module.__class__.__name__.lower() or 'modrelu' in str(module).lower():
-            for p in module.parameters():
-                modrelu_g = max(modrelu_g, _grad_norm(p))
-    lines.append('grad physical/last_complex/modReLU={:.3g}/{:.3g}/{:.3g}'.format(physical_g, complex_g, modrelu_g))
-    return ' | '.join(lines)
-
-
-@torch.no_grad()
-def _fixed_patch_debug(model, patch, mode, mask_ratio, mask_min_dist):
-    """Compare one fixed validation patch with and without training masking."""
-    model.eval()
-    full = model(patch)
-    masked_input, _, mask = make_directional_mask_pair(
-        patch, mode=mode, mask_ratio=mask_ratio, min_dist=mask_min_dist,
-        lattice_random_phase=False,
-    )
-    masked = model(masked_input)
-    valid = mask[:, 0].bool()
-
-    def summary(x, selector=None):
-        y = x if selector is None else x[selector]
-        vals = []
-        for i in range(3):
-            z = (x[:, i][valid] if selector is None else y[:, i][valid])
-            vals.append('{:.3g}/{:.3g}/{:.3g}'.format(
-                float(z.mean()), float(z.min()), float(torch.quantile(z.float(), torch.tensor(.01, device=z.device)))))
-        return ','.join(vals)
-
-    return 'fixed_val unmasked(mean/min/p1)={} masked={}'.format(summary(full), summary(masked))
-
 from likelihood.dataset import (
     multibatch_test_save_srdtrans,
     singlebatch_test_save_srdtrans,
@@ -123,8 +54,6 @@ from posterior.losses_gamma import (
     masked_l1_l2_loss,
     gamma_nb_nll_single_target as _gamma_nb_nll_single_target,
     gamma_nb_predictive_and_posterior,
-    gamma_mixture_nb_predictive_and_posterior,
-    gamma_mixture_nb_nll_from_ab,
 )
 from posterior.gamma_posterior import (
     gamma_ab_from_mu_kappa,
@@ -137,7 +66,6 @@ from posterior.dual_context_prior import (
     dual_axis_context_prior,
     dual_axis_from_sampling_mode,
 )
-from posterior.analytic_representation import analytic_projection, quadrature_contribution
 
 
 _PARALLEL_TYPES = (nn.DataParallel, DistributedDataParallel)
@@ -200,6 +128,10 @@ class training_class_srdtrans_gamma:
         self.select_img_num = 100000
         self.num_workers = 4
         self.backbone = 'srdtrans_v2'
+        self.representation = 'dtcwt'
+        self.dtcwt_dim = 2
+        self.dtcwt_levels = 3
+        self.dtcwt_embed_channels = 8
         self.sampling_mode = 'spatial'
         # Full-resolution directional masked self-supervision.
         # spatial_mask / temporal_mask keep input shape [B, C, T, H, W] unchanged
@@ -247,7 +179,6 @@ class training_class_srdtrans_gamma:
         self.no_resume = False
         self.eval_val_per_epoch = True
         self.eval_every_iters = 0
-        self.debug_every_steps = 50
         self.val_process_frames = 400
         self.snr_margin = 50
         self.save_test_images_per_epoch = True
@@ -420,11 +351,12 @@ class training_class_srdtrans_gamma:
             'batch_size', 'patch_x', 'patch_y', 'patch_t', 'gap_y', 'gap_x', 'gap_t',
             'lr', 'b1', 'b2', 'fmap', 'select_img_num',
             'train_datasets_size', 'overlap_factor', 'val_overlap_factor',
-            'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'debug_every_steps', 'backbone',
+            'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'backbone',
             'checkpoint_every_epochs', 'validation_every_epochs',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate', 'srdtrans_f_maps', 'input_dropout_rate',
-            'sampling_mode',
+            'sampling_mode', 'representation', 'dtcwt_dim', 'dtcwt_levels',
+            'dtcwt_embed_channels',
             'mask_ratio', 'mask_min_dist', 'lattice_random_phase', 'slice_axis', 'seed',
             'trans_order', 'space_post_norm', 'space_dropout_rate',
             'use_msconv_before_trans', 'mask_loss', 'kappa_mode',
@@ -480,24 +412,27 @@ class training_class_srdtrans_gamma:
         x = torch.randn(
             1, 1, self.patch_t, self.patch_y, self.patch_x, device=device
         ) + 0.1 * self.rank
-        candidates = self.local_model(x)
-        mu_lambda = _safe_mu_lambda((candidates + 5000.0) / 5000.0)
+        output = self.local_model(x)
+        mu_centered = output[:, 0:1]
+        mu_lambda = _safe_mu_lambda((mu_centered + 5000.0) / 5000.0)
+        kappa = (torch.exp(output[:, 1:2]) + self.mpgn_kappa_min
+                 if output.shape[1] == 2 else torch.full_like(mu_lambda, float(self.mpgn_kappa)))
         a, b = gamma_ab_from_mu_kappa(
-            mu_lambda, torch.full_like(mu_lambda, float(self.mpgn_kappa))
+            mu_lambda, kappa
         )
         mask = torch.zeros_like(x, dtype=torch.bool)
         mask[:, :, ::2, ::2, ::2] = True
-        loss = gamma_mixture_nb_nll_from_ab(
+        loss = gamma_nb_predictive_and_posterior(
             a,
             b,
             x + 5000.0,
-            mask,
+            valid_mask=mask,
             alpha=5000.0,
             beta=1600.0,
             kmax=int(self.mpgn_kmax),
             chunk_t=int(self.mpgn_nll_chunk_t),
             tail_tol=float(self.mpgn_k_tail_tol),
-        )
+        )['nll_mean']
         loss.backward()
         gradients = [
             parameter.grad
@@ -520,13 +455,13 @@ class training_class_srdtrans_gamma:
         if self.is_main_process:
             with torch.inference_mode():
                 validation_output = _unwrap_model(self.local_model)(x)
-            if validation_output.shape != candidates.shape:
+            if validation_output.shape != output.shape:
                 raise RuntimeError('rank-0 validation output shape changed')
         dist.barrier()
         if self.is_main_process:
             print(
                 'DDP smoke test passed: world_size={} output={} loss={:.6f}'.format(
-                    self.world_size, tuple(candidates.shape), loss.detach().item()
+                    self.world_size, tuple(output.shape), loss.detach().item()
                 )
             )
 
@@ -624,19 +559,10 @@ class training_class_srdtrans_gamma:
                 generator=loader_generator,
                 worker_init_fn=worker_init_fn,
             )
-            # Diagnostic for the clamp's zero-gradient region (per candidate).
-            metric_device = next(self.local_model.parameters()).device
-            clamp_hits = torch.zeros(3, device=metric_device, dtype=torch.float64)
-            clamp_total = torch.zeros(3, device=metric_device, dtype=torch.float64)
             if epoch == start_epoch and start_epoch > 0:
                 global_iter = start_epoch * len(trainloader)
 
             for iteration, batch in enumerate(trainloader):
-                debug_now = (getattr(self, 'debug_every_steps', 0) > 0
-                             and (global_iter + 1) % int(self.debug_every_steps) == 0)
-                debug_structured = None
-                debug_raw_mu = None
-                a = b = None
                 if self.sampling_mode == 'temporal':
                     inp, tgt = batch
                     if cuda:
@@ -730,58 +656,25 @@ class training_class_srdtrans_gamma:
                                 )
                             )
 
-                        if debug_now and hasattr(_unwrap_model(self.local_model), 'forward_with_complex'):
-                            noisy_output, debug_structured = self.local_model(masked_input, return_complex=True)
-                        else:
-                            noisy_output = self.local_model(masked_input)
+                        noisy_output = self.local_model(masked_input)
                         if getattr(self, 'mask_loss', 'l1l2') == 'nll':
                             patch_mean = stack_global_mean.view(-1, 1, 1, 1, 1)
-                            if noisy_output.shape[1] == 1:
-                                total_loss = _gamma_nb_nll_single_target(
-                                    noisy_output,
-                                    masked_target,
-                                    loss_mask,
-                                    pred_img_mean=patch_mean,
-                                    target_img_mean=patch_mean,
-                                    alpha=self.mpgn_alpha,
-                                    beta=self.mpgn_beta,
-                                    kappa=self.mpgn_kappa,
-                                    offset=self.mpgn_offset,
-                                    kmax=int(self.mpgn_kmax),
-                                    chunk_t=int(self.mpgn_nll_chunk_t),
-                                    tail_tol=float(self.mpgn_k_tail_tol),
-                                )
-                                mixture = None
-                            elif noisy_output.shape[1] != 3:
-                                raise RuntimeError(
-                                    'analytic complex SRDTrans must return three candidates, got {}'.format(
-                                        tuple(noisy_output.shape)
-                                    )
-                                )
-                            else:
-                                mu_phys = noisy_output + patch_mean
-                                clamp_hits += (mu_phys <= float(self.mpgn_offset)).sum(
-                                    dim=(0, 2, 3, 4), dtype=torch.float64
-                                ).detach()
-                                clamp_total += float(mu_phys[:, 0].numel())
-                                debug_raw_mu = (mu_phys - float(self.mpgn_offset)) / float(self.mpgn_alpha)
-                                mu_lambda = _safe_mu_lambda(
-                                    debug_raw_mu
-                                )
-                                kappa = torch.full_like(mu_lambda, float(self.mpgn_kappa))
-                                a, b = gamma_ab_from_mu_kappa(mu_lambda, kappa)
-                                total_loss = gamma_mixture_nb_nll_from_ab(
-                                    a,
-                                    b,
-                                    masked_target + patch_mean,
-                                    loss_mask,
-                                    alpha=self.mpgn_alpha,
-                                    beta=self.mpgn_beta,
-                                    offset=self.mpgn_offset,
-                                    kmax=int(self.mpgn_kmax),
-                                    chunk_t=int(self.mpgn_nll_chunk_t),
-                                    tail_tol=float(self.mpgn_k_tail_tol),
-                                )
+                            if noisy_output.shape[1] != 1:
+                                raise RuntimeError('fixed-kappa NLL expects one reconstructed image')
+                            total_loss = _gamma_nb_nll_single_target(
+                                noisy_output,
+                                masked_target,
+                                loss_mask,
+                                pred_img_mean=patch_mean,
+                                target_img_mean=patch_mean,
+                                alpha=self.mpgn_alpha,
+                                beta=self.mpgn_beta,
+                                kappa=self.mpgn_kappa,
+                                offset=self.mpgn_offset,
+                                kmax=int(self.mpgn_kmax),
+                                chunk_t=int(self.mpgn_nll_chunk_t),
+                                tail_tol=float(self.mpgn_k_tail_tol),
+                            )
                         else:
                             if noisy_output.shape[1] != 1:
                                 noisy_output = noisy_output[:, 0:1]
@@ -816,34 +709,6 @@ class training_class_srdtrans_gamma:
                     global_loss /= self.world_size
                 else:
                     global_loss = total_loss.detach()
-                if debug_now and debug_structured is not None and debug_raw_mu is not None:
-                    debug_text = _complex_debug(self.local_model, debug_raw_mu, debug_structured, loss_mask)
-                    responsibility_text = ''
-                    if a is not None and b is not None:
-                        resp_result = gamma_mixture_nb_predictive_and_posterior(
-                            a.detach(), b.detach(), masked_target.detach() + patch_mean.detach(),
-                            alpha=self.mpgn_alpha, beta=self.mpgn_beta,
-                            offset=self.mpgn_offset, valid_mask=loss_mask,
-                            kmax=int(self.mpgn_kmax), chunk_t=int(self.mpgn_nll_chunk_t),
-                            tail_tol=float(self.mpgn_k_tail_tol),
-                        )
-                        resp = resp_result['component_responsibility']
-                        responsibility_text = ' responsibility=' + '/'.join(
-                            '{:.4f}'.format(float(resp[:, i][loss_mask[:, 0].bool()].mean()))
-                            for i in range(3)
-                        )
-                    if not self._eval_cache_ready:
-                        self._prepare_eval_cache()
-                    val_patch = torch.from_numpy(
-                        self._eval_noise_img[:self.patch_t, :self.patch_y, :self.patch_x]
-                    ).float().unsqueeze(0).unsqueeze(0).to(next(self.local_model.parameters()).device)
-                    debug_text += ' | ' + _fixed_patch_debug(
-                        self.local_model, val_patch, self.sampling_mode,
-                        self.mask_ratio, self.mask_min_dist,
-                    ) + responsibility_text
-                    self.local_model.train()
-                    if self.is_main_process:
-                        print('\n[debug step {}] {} | global_loss={:.5f}'.format(global_iter + 1, debug_text, float(global_loss)))
                 optimizer_G.step()
                 global_iter += 1
 
@@ -907,16 +772,6 @@ class training_class_srdtrans_gamma:
                     if self.is_main_process:
                         self.local_model.train()
                         print('\n', end=' ')
-
-            if self.distributed:
-                dist.all_reduce(clamp_hits, op=dist.ReduceOp.SUM)
-                dist.all_reduce(clamp_total, op=dist.ReduceOp.SUM)
-            if self.is_main_process and clamp_total.sum().item() > 0:
-                ratios = (clamp_hits / clamp_total.clamp_min(1)).tolist()
-                print(
-                    'Clamp ratio (mu_phys <= offset) x/y/t: '
-                    '{:.3%}/{:.3%}/{:.3%}'.format(*ratios)
-                )
 
     def save_model(self, epoch, iteration):
         os.makedirs(self.pth_path, exist_ok=True)
@@ -1079,13 +934,7 @@ class training_class_srdtrans_gamma:
 
         time_start = time.time()
         vol_post = np.zeros(noise_img.shape, dtype=np.float32)
-        vol_map = np.zeros(noise_img.shape, dtype=np.float32)
-        vol_map_boundary = np.zeros(noise_img.shape, dtype=np.float32)
         vol_noisy = np.zeros(noise_img.shape, dtype=np.float32)
-        vol_candidates = {
-            direction: np.zeros(noise_img.shape, dtype=np.float32)
-            for direction in ('x', 'y', 't')
-        }
 
         test_data = testset_srdtrans(name_list, coordinate_list, noise_img)
         testloader = DataLoader(
@@ -1107,30 +956,14 @@ class training_class_srdtrans_gamma:
         img_mean_t = torch.as_tensor(img_mean, dtype=dtype, device=device)
 
         self.local_model.eval()
-        q = {'x': [], 'y': [], 't': []}
         with torch.inference_mode():
             for iteration, (noise_patch, single_coordinate) in enumerate(testloader):
                 if cuda:
                     noise_patch = noise_patch.cuda()
                 local = _unwrap_model(self.local_model)
-                if hasattr(local, 'forward_with_complex'):
-                    mu_centered, complex_output = local(
-                        noise_patch, return_complex=True
-                    )
-                    for index, direction in enumerate(('x', 'y', 't')):
-                        q[direction].extend(
-                            quadrature_contribution(
-                                complex_output[:, index:index + 1], direction
-                            ).cpu().tolist()
-                        )
-                else:
-                    mu_centered = local(noise_patch)
-                if mu_centered.shape[1] not in (1, 3):
-                    raise RuntimeError(
-                        'expected one prior or three analytic candidates, got {}'.format(
-                            tuple(mu_centered.shape)
-                        )
-                    )
+                mu_centered = local(noise_patch)
+                if mu_centered.shape[1] != 1:
+                    raise RuntimeError('fixed-kappa validation expects one reconstructed image')
                 y_phys = noise_patch + img_mean_t
                 mu_phys = mu_centered + img_mean_t
                 mu_lambda = (mu_phys - offset_t) / alpha_t
@@ -1143,30 +976,14 @@ class training_class_srdtrans_gamma:
                     tail_tol=float(self.mpgn_k_tail_tol),
                     chunk_t=int(self.mpgn_nll_chunk_t),
                 )
-                if mu_centered.shape[1] == 3:
-                    posterior = gamma_mixture_nb_predictive_and_posterior(
-                        a, b, y_phys, compute_map=True, **posterior_kwargs
-                    )
-                    x_map = posterior['x_map_phys']
-                    map_boundary = posterior['map_boundary'].to(dtype=x_map.dtype)
-                else:
-                    posterior = gamma_nb_predictive_and_posterior(
-                        a, b, y_phys, **posterior_kwargs
-                    )
-                    x_map = posterior['x_post_phys']
-                    map_boundary = torch.zeros_like(x_map)
+                posterior = gamma_nb_predictive_and_posterior(
+                    a, b, y_phys, **posterior_kwargs
+                )
                 x_post = posterior['x_post_phys']
                 maps = {
                     'post': x_post,
-                    'map': x_map,
-                    'map_boundary': map_boundary,
                     'noisy': y_phys,
                 }
-                if mu_phys.shape[1] == 3:
-                    maps.update({
-                        'candidate_{}'.format(direction): mu_phys[:, index:index + 1]
-                        for index, direction in enumerate(('x', 'y', 't'))
-                    })
                 np_maps = {}
                 for k, v in maps.items():
                     arr = v.detach().cpu().numpy()
@@ -1175,15 +992,8 @@ class training_class_srdtrans_gamma:
                     np_maps[k] = arr
                 volumes = {
                     'post': vol_post,
-                    'map': vol_map,
-                    'map_boundary': vol_map_boundary,
                     'noisy': vol_noisy,
                 }
-                if mu_phys.shape[1] == 3:
-                    volumes.update({
-                        'candidate_{}'.format(direction): volume
-                        for direction, volume in vol_candidates.items()
-                    })
                 self._stitch_volume_maps(volumes, np_maps, single_coordinate)
                 print(
                     '\r [Patch %d/%d]'
@@ -1199,54 +1009,30 @@ class training_class_srdtrans_gamma:
         if e <= s:
             s, e = 0, eval_t
         snr_post = cal_snr_srdtrans(vol_post[s:e], ref_img[s:e])
-        snr_map = cal_snr_srdtrans(vol_map[s:e], ref_img[s:e])
         snr_noisy = cal_snr_srdtrans(vol_noisy[s:e], ref_img[s:e])
-        snr_candidates = {
-            direction: (
-                cal_snr_srdtrans(volume[s:e], ref_img[s:e])
-                if q[direction] else float('nan')
-            )
-            for direction, volume in vol_candidates.items()
-        }
-        map_boundary_fraction = float(vol_map_boundary[s:e].mean())
-        q_mean = {
-            direction: float(np.mean(values)) if values else float('nan')
-            for direction, values in q.items()
-        }
         print(
-            'SNR (frames {:d}:{:d}; posterior mean / MAP / noisy vs GT) '
-            '-----> {:.4f} dB / {:.4f} dB / {:.4f} dB; '
-            'candidates x/y/t {:.4f}/{:.4f}/{:.4f} dB; MAP@0 {:.2%}'.format(
-                s, e, snr_post, snr_map, snr_noisy,
-                snr_candidates['x'], snr_candidates['y'], snr_candidates['t'],
-                map_boundary_fraction,
+            'SNR (frames {:d}:{:d}; posterior mean / noisy vs GT) '
+            '-----> {:.4f} dB / {:.4f} dB'.format(
+                s, e, snr_post, snr_noisy,
             )
         )
-        metrics_path = os.path.join(self.pth_path, 'val_metrics.md')
+        metrics_path = os.path.join(self.pth_path, 'val_metrics_dtcwt.md')
         if not os.path.exists(metrics_path):
             with open(metrics_path, 'w') as f:
                 f.write(
-                    '| Epoch | Iteration | SNR_mean (dB) | SNR_MAP (dB) | SNR_noisy (dB) | MAP@0 | κ | SNR_x | SNR_y | SNR_t | qx | qy | qt |\n'
+                    '| Epoch | Iteration | SNR_mean (dB) | SNR_noisy (dB) | κ |\n'
                 )
                 f.write(
-                    '| ----- | --------- | ------------- | ------------ | -------------- | ----- | --- | ----- | ----- | ----- | -- | -- | -- |\n'
+                    '| ----- | --------- | ------------- | -------------- | --- |\n'
                 )
         with open(metrics_path, 'a') as f:
             f.write(
-                '| {} | {} | {:.4f} | {:.4f} | {:.4f} | {:.6f} | {:.1f} | {:.4f} | {:.4f} | {:.4f} | {:.6f} | {:.6f} | {:.6f} |\n'.format(
+                '| {} | {} | {:.4f} | {:.4f} | {:.1f} |\n'.format(
                     train_epoch + 1,
                     train_iteration + 1,
                     snr_post,
-                    snr_map,
                     snr_noisy,
-                    map_boundary_fraction,
                     kappa,
-                    snr_candidates['x'],
-                    snr_candidates['y'],
-                    snr_candidates['t'],
-                    q_mean['x'],
-                    q_mean['y'],
-                    q_mean['t'],
                 )
             )
         elapsed = time.time() - time_start
@@ -1261,16 +1047,15 @@ class training_class_srdtrans_gamma:
                 str(train_iteration + 1).zfill(4),
             )
             input_data_type = self._eval_input_data_type
-            for estimator, volume in (('posterior_mean', vol_post), ('posterior_map', vol_map)):
-                out = volume[s:e]
-                path = os.path.join(
-                    self.pth_path, '{}_{}_{}.tif'.format(stem, tag, estimator)
-                )
-                if input_data_type == 'uint16':
-                    out = np.clip(out, 0, 65535).astype('uint16')
-                else:
-                    out = out.astype(np.float32)
-                io.imsave(path, out, check_contrast=False)
+            out = vol_post[s:e]
+            path = os.path.join(
+                self.pth_path, '{}_{}_posterior_mean.tif'.format(stem, tag)
+            )
+            if input_data_type == 'uint16':
+                out = np.clip(out, 0, 65535).astype('uint16')
+            else:
+                out = out.astype(np.float32)
+            io.imsave(path, out, check_contrast=False)
 
     def _test_dual_exhaustive(self, train_epoch, train_iteration):
         """Exhaustive dual-context prior + one-shot MPGN posterior correction."""

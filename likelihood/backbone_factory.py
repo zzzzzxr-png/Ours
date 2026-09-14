@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from prior.deepcadrt import Network_3D_Unet
-from posterior.analytic_representation import analytic_representation, inverse_candidates
+from representation import DTCWT2D, FullResolutionDTCWTAdapter
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DEFAULT_SRDTRANS_ROOT = os.path.join(_PROJECT_ROOT, 'prior', 'srdtrans', 'SRDTrans_v2')
@@ -48,55 +48,40 @@ class LearnedKappaHead(nn.Module):
         return torch.cat([mu, raw_kappa], dim=1)
 
 
-class AnalyticComplexBackbone(nn.Module):
-    """Axis-Hilbert input -> complex latent -> structured analytic readout."""
+class DTCWTComplexBackbone(nn.Module):
+    """Real video -> DTCWT/adapters -> unchanged complex SRDTrans -> real video."""
 
-    def __init__(self, backbone: nn.Module):
+    def __init__(self, backbone: nn.Module, levels=3, image_channels=1,
+                 feature_channels=8,
+                 biort='near_sym_b', qshift='qshift_b'):
         super().__init__()
         self.backbone = backbone
-        self.physical_readout = nn.Conv3d(6, 4, kernel_size=1)
-        # Start from the physically structured map, then allow the readout
-        # to learn corrections without an arbitrary real/imaginary mixing.
-        with torch.no_grad():
-            self.physical_readout.weight.zero_()
-            self.physical_readout.weight[0, 0:3, 0, 0, 0] = 1.0 / 3.0
-            self.physical_readout.weight[1, 3, 0, 0, 0] = 1.0
-            self.physical_readout.weight[2, 4, 0, 0, 0] = 1.0
-            self.physical_readout.weight[3, 5, 0, 0, 0] = 1.0
-            self.physical_readout.bias.zero_()
+        self.representation = DTCWT2D(levels=levels, biort=biort, qshift=qshift)
+        self.adapter = FullResolutionDTCWTAdapter(
+            image_channels=image_channels, levels=levels,
+            feature_channels=feature_channels,
+        )
 
-    def forward_with_complex(self, x):
+    def forward(self, x):
         if x.ndim != 5 or x.shape[1] != 1 or x.is_complex():
             raise ValueError(
                 'expected real [B,1,T,H,W], got shape={} dtype={}'.format(
                     tuple(x.shape), x.dtype
                 )
             )
-        latent_complex = self.backbone(analytic_representation(x))
-        if latent_complex.shape[1] != 3 or not latent_complex.is_complex():
+        coefficients = self.representation(x)
+        features = self.adapter.encode(coefficients)
+        predicted = self.backbone(features)
+        if predicted.shape != features.shape or not predicted.is_complex():
             raise RuntimeError(
-                'complex SRDTrans must return complex [B,3,T,H,W], got '
-                'shape={} dtype={}'.format(
-                    tuple(latent_complex.shape), latent_complex.dtype
+                'complex SRDTrans changed DTCWT feature shape/dtype: {} {} -> {} {}'.format(
+                    tuple(features.shape), features.dtype,
+                    tuple(predicted.shape), predicted.dtype,
                 )
             )
-        latent_real = torch.cat([latent_complex.real, latent_complex.imag], dim=1)
-        physical = self.physical_readout(latent_real)
-        shared_real = physical[:, 0:1]
-        structured_output = torch.cat(
-            [
-                torch.complex(shared_real, physical[:, index:index + 1])
-                for index in range(1, 4)
-            ],
-            dim=1,
+        return self.representation.inverse(
+            self.adapter.decode_residual(predicted, coefficients)
         )
-        return inverse_candidates(structured_output), structured_output
-
-    def forward(self, x, return_complex=False):
-        candidates, complex_output = self.forward_with_complex(x)
-        if return_complex:
-            return candidates, complex_output
-        return candidates
 
 
 def ensure_srdtrans_repo_on_path(srdtrans_root=None):
@@ -168,7 +153,7 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     model = ModelClass(
         img_dim=int(cfg.patch_x),
         img_time=int(cfg.patch_t),
-        in_channel=3,
+        in_channel=int(getattr(cfg, 'dtcwt_embed_channels', 8)),
         embedding_dim=int(getattr(cfg, 'embedding_dim', 128)),
         num_heads=int(getattr(cfg, 'num_heads', 8)),
         hidden_dim=int(getattr(cfg, 'hidden_dim', 128 * 4)),
@@ -220,8 +205,21 @@ def build_denoise_network_srdtrans(cfg):
             param_num / 1e6))
     elif backbone in ('srdtrans_v2', 'SRDTrans_v2'):
         SRDTrans_v2 = import_srdtrans_v2_class(getattr(cfg, 'srdtrans_root', None))
-        model = AnalyticComplexBackbone(
-            _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2)
+        representation = getattr(cfg, 'representation', 'dtcwt')
+        dtcwt_dim = int(getattr(cfg, 'dtcwt_dim', 2))
+        if representation != 'dtcwt':
+            raise ValueError('SRDTrans_v2 representation must be dtcwt, got {!r}'.format(
+                representation))
+        # ponytail: 2D only; add a published differentiable 3D backend when requested.
+        if dtcwt_dim != 2:
+            raise NotImplementedError('Only --dtcwt_dim 2 is implemented')
+        levels = int(getattr(cfg, 'dtcwt_levels', 3))
+        model = DTCWTComplexBackbone(
+            _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2),
+            levels=levels,
+            feature_channels=int(getattr(cfg, 'dtcwt_embed_channels', 8)),
+            biort=getattr(cfg, 'dtcwt_biort', 'near_sym_b'),
+            qshift=getattr(cfg, 'dtcwt_qshift', 'qshift_b'),
         )
     else:
         raise ValueError(
@@ -230,11 +228,6 @@ def build_denoise_network_srdtrans(cfg):
         )
 
     kappa_mode = getattr(cfg, 'kappa_mode', 'fixed')
-    if isinstance(model, AnalyticComplexBackbone) and kappa_mode == 'learned_map':
-        raise ValueError(
-            'analytic complex SRDTrans currently requires fixed kappa; '
-            'reuse the selected --mpgn_kappa value'
-        )
     if kappa_mode == 'learned_map':
         kappa_init = float(getattr(cfg, 'mpgn_kappa_init', 50.0))
         kappa_min = float(getattr(cfg, 'mpgn_kappa_min', 1e-4))
