@@ -140,7 +140,7 @@ def _build_transformer_protocol_model(cfg, ModelClass, label):
 
 
 def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
-    f_maps = getattr(cfg, 'srdtrans_f_maps', None) or [8, 16, 32, 64]
+    f_maps = list(getattr(cfg, 'srdtrans_f_maps', None) or [8, 16, 32, 64])
     trans_order = getattr(cfg, 'trans_order', 'ts')
     space_post_norm = bool(getattr(cfg, 'space_post_norm', False))
     space_dropout_rate = float(getattr(cfg, 'space_dropout_rate', 0.0))
@@ -148,6 +148,7 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     levels = int(getattr(cfg, 'dtcwt_levels', 3))
     coefficient_dim = int(cfg.patch_x) // 2
     coefficient_channels = 2 + 6 * levels
+    f_maps[0] = coefficient_channels
 
     model = ModelClass(
         img_dim=coefficient_dim,
