@@ -32,7 +32,17 @@ def main():
     target = torch.randn_like(masked)
     prediction = model(masked)
     assert prediction.shape == masked.shape and not prediction.is_complex()
-    assert ((prediction - masked).norm() / masked.norm()).item() < 1e-6
+    assert torch.isfinite(prediction).all()
+
+    coefficients = model.representation(masked)
+    zero_features = torch.zeros(
+        masked.shape[0], model.adapter.feature_channels, masked.shape[2],
+        *coefficients.highs[0].shape[-2:],
+        dtype=torch.complex64, device=device,
+    )
+    direct = model.adapter.decode(zero_features, coefficients)
+    assert direct.low.count_nonzero() == 0
+    assert all(high.count_nonzero() == 0 for high in direct.highs)
 
     mean = 10.0
     mu_lambda = (prediction + mean).clamp_min(1e-6)
@@ -48,11 +58,10 @@ def main():
     gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
     assert gradients and all(gradient is not None for gradient in gradients)
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
-    decoder_gradients = [
-        parameter.grad for projection in model.adapter.output_projections
-        for parameter in projection.parameters()
+    backbone_gradients = [
+        parameter.grad for parameter in model.backbone.parameters()
     ]
-    assert any(gradient.abs().sum() > 0 for gradient in decoder_gradients)
+    assert any(gradient.abs().sum() > 0 for gradient in backbone_gradients)
     print('DTCWT complex Gamma pipeline checks passed')
 
 

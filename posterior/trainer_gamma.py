@@ -131,7 +131,6 @@ class training_class_srdtrans_gamma:
         self.representation = 'dtcwt'
         self.dtcwt_dim = 2
         self.dtcwt_levels = 3
-        self.dtcwt_embed_channels = 8
         self.sampling_mode = 'spatial'
         # Full-resolution directional masked self-supervision.
         # spatial_mask / temporal_mask keep input shape [B, C, T, H, W] unchanged
@@ -356,7 +355,6 @@ class training_class_srdtrans_gamma:
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate', 'srdtrans_f_maps', 'input_dropout_rate',
             'sampling_mode', 'representation', 'dtcwt_dim', 'dtcwt_levels',
-            'dtcwt_embed_channels',
             'mask_ratio', 'mask_min_dist', 'lattice_random_phase', 'slice_axis', 'seed',
             'trans_order', 'space_post_norm', 'space_dropout_rate',
             'use_msconv_before_trans', 'mask_loss', 'kappa_mode',

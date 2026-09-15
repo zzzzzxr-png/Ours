@@ -87,7 +87,6 @@ def parse_args():
     parser.add_argument('--representation', type=str, default='dtcwt', choices=['dtcwt'])
     parser.add_argument('--dtcwt_dim', type=int, default=2, choices=[2, 3])
     parser.add_argument('--dtcwt_levels', type=int, default=3)
-    parser.add_argument('--dtcwt_embed_channels', type=int, default=8)
     parser.add_argument('--fmap', type=int, default=16,
                         help='3D U-Net feature maps (ignored for transformer backbones)')
     parser.add_argument('--srdtrans-root', type=str, default=DEFAULT_SRDTRANS_ROOT,
@@ -282,7 +281,6 @@ def main():
         'representation': args.representation,
         'dtcwt_dim': args.dtcwt_dim,
         'dtcwt_levels': args.dtcwt_levels,
-        'dtcwt_embed_channels': args.dtcwt_embed_channels,
         'srdtrans_root': args.srdtrans_root,
         'embedding_dim': args.embedding_dim,
         'num_heads': args.num_heads,

@@ -7,7 +7,7 @@ DATA_ROOT=/data/zhouxirou/All_Datasets/dataset_CI_syn_Q004_a5000_b1600/dataset_z
 common_args=(
   --patch_xy 128 --patch_t 128
   --overlap_factor 0.75 --val_overlap_factor 0.5
-  --n_epochs 100 --lr 5e-5 --train_datasets_size 6000
+  --n_epochs 100  --lr 5e-5 --debug_every_steps 50 --train_datasets_size 6000
   --sampling_mode temporal_mask --backbone srdtrans_v2 --fmap 16
   --embedding-dim 128 --num-heads 8 --hidden-dim 512 --window-size 7
   --num-trans-block 1 --attn-dropout-rate 0.1 --input-dropout-rate 0

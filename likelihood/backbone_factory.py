@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from prior.deepcadrt import Network_3D_Unet
-from representation import DTCWT2D, FullResolutionDTCWTAdapter
+from representation import DTCWT2D, DTCWTScaleAdapter
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DEFAULT_SRDTRANS_ROOT = os.path.join(_PROJECT_ROOT, 'prior', 'srdtrans', 'SRDTrans_v2')
@@ -52,15 +52,11 @@ class DTCWTComplexBackbone(nn.Module):
     """Real video -> DTCWT/adapters -> unchanged complex SRDTrans -> real video."""
 
     def __init__(self, backbone: nn.Module, levels=3, image_channels=1,
-                 feature_channels=8,
                  biort='near_sym_b', qshift='qshift_b'):
         super().__init__()
         self.backbone = backbone
         self.representation = DTCWT2D(levels=levels, biort=biort, qshift=qshift)
-        self.adapter = FullResolutionDTCWTAdapter(
-            image_channels=image_channels, levels=levels,
-            feature_channels=feature_channels,
-        )
+        self.adapter = DTCWTScaleAdapter(image_channels=image_channels, levels=levels)
 
     def forward(self, x):
         if x.ndim != 5 or x.shape[1] != 1 or x.is_complex():
@@ -80,7 +76,7 @@ class DTCWTComplexBackbone(nn.Module):
                 )
             )
         return self.representation.inverse(
-            self.adapter.decode_residual(predicted, coefficients)
+            self.adapter.decode(predicted, coefficients)
         )
 
 
@@ -149,11 +145,14 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     space_post_norm = bool(getattr(cfg, 'space_post_norm', False))
     space_dropout_rate = float(getattr(cfg, 'space_dropout_rate', 0.0))
     use_msconv_before_trans = bool(getattr(cfg, 'use_msconv_before_trans', False))
+    levels = int(getattr(cfg, 'dtcwt_levels', 3))
+    coefficient_dim = int(cfg.patch_x) // 2
+    coefficient_channels = 2 + 6 * levels
 
     model = ModelClass(
-        img_dim=int(cfg.patch_x),
+        img_dim=coefficient_dim,
         img_time=int(cfg.patch_t),
-        in_channel=int(getattr(cfg, 'dtcwt_embed_channels', 8)),
+        in_channel=coefficient_channels,
         embedding_dim=int(getattr(cfg, 'embedding_dim', 128)),
         num_heads=int(getattr(cfg, 'num_heads', 8)),
         hidden_dim=int(getattr(cfg, 'hidden_dim', 128 * 4)),
@@ -171,7 +170,7 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     print(
         '\033[1;31mSRDTrans protocol / SRDTrans_v2 img_dim={} img_time={} '
         'trans_order={} msconv={} space_post_norm={} params={:.2f}M\033[0m'.format(
-            int(cfg.patch_x),
+            coefficient_dim,
             int(cfg.patch_t),
             trans_order,
             use_msconv_before_trans,
@@ -217,7 +216,6 @@ def build_denoise_network_srdtrans(cfg):
         model = DTCWTComplexBackbone(
             _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2),
             levels=levels,
-            feature_channels=int(getattr(cfg, 'dtcwt_embed_channels', 8)),
             biort=getattr(cfg, 'dtcwt_biort', 'near_sym_b'),
             qshift=getattr(cfg, 'dtcwt_qshift', 'qshift_b'),
         )
