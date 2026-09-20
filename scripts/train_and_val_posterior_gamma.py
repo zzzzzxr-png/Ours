@@ -21,6 +21,7 @@ sys.path.insert(0, _PROJECT_ROOT)
 
 
 from likelihood.backbone_factory import DEFAULT_SRDTRANS_ROOT
+from likelihood.trainer import training_class_srdtrans
 from posterior.trainer_gamma import training_class_srdtrans_gamma
 
 
@@ -64,6 +65,7 @@ def parse_args():
                         choices=[
                             'temporal',
                             'spatial',
+                            'spatial_mask',
                             'temporal_mask',
                             'height_mask',
                             'width_mask',
@@ -74,9 +76,12 @@ def parse_args():
                             'slice_mask',
                             'n2v',
                         ],
-                        help='Training sampling strategy. Dual-context Gamma uses '
-                             'height_mask (H±), width_mask (W±), or temporal_mask (T±). '
-                             'Legacy spatial_mask is removed (split into height/width).')
+                        help='Training sampling strategy. Pure-network mode also supports '
+                             'single-replacement spatial_mask (H/W neighbors).')
+    parser.add_argument(
+        '--pure-network', action='store_true',
+        help='Use masked L1+L2 and direct network validation without Gamma/MPGN posterior.',
+    )
     parser.add_argument('--backbone', type=str, default='srdtrans_v2',
                         choices=[
                             'unet',
@@ -87,6 +92,16 @@ def parse_args():
     parser.add_argument('--representation', type=str, default='dtcwt', choices=['dtcwt'])
     parser.add_argument('--dtcwt_dim', type=int, default=2, choices=[2, 3])
     parser.add_argument('--dtcwt_levels', type=int, default=3)
+    parser.add_argument('--dtcwt-channel-normalize', action='store_true',
+                        help='Normalize each aligned complex DTCWT channel by its RMS.')
+    parser.add_argument('--adaptive-grad-clip', action='store_true',
+                        help='Calibrate a fixed global gradient-norm clip from warmup.')
+    parser.add_argument('--grad-clip-warmup-iters', type=int, default=1000)
+    parser.add_argument('--grad-clip-percentile', type=float, default=95.0)
+    parser.add_argument('--grad-clip-warmup-cap', type=float, default=1e8)
+    parser.add_argument('--grad-clip-median-multiplier', type=float, default=2.0)
+    parser.add_argument('--diagnostic-interval', type=int, default=0,
+                        help='Write stage activation/gradient/update diagnostics every N iterations.')
     parser.add_argument('--fmap', type=int, default=16,
                         help='3D U-Net feature maps (ignored for transformer backbones)')
     parser.add_argument('--srdtrans-root', type=str, default=DEFAULT_SRDTRANS_ROOT,
@@ -125,6 +140,10 @@ def parse_args():
         default=True,
         help='Legacy flag (dual-context uses complementary group sampling instead).',
     )
+    parser.add_argument(
+        '--random-patch-coordinates', action='store_true',
+        help='Draw new reproducible crop coordinates for every patch in every epoch.',
+    )
     parser.add_argument('--slice_axis', type=str, default='random',
                         choices=['random', 't', 'h', 'w'],
                         help='Slice axis for slice_mask mode: random or fixed T/H/W.')
@@ -144,6 +163,12 @@ def parse_args():
                         default=False,
                         help='SRDTrans_v2: MSConvBeforeTrans instead of 3x3x3 '
                              'conv_before_trans')
+    parser.add_argument(
+        '--gradient-checkpointing',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Recompute SRDTrans blocks during backward to reduce memory.',
+    )
     parser.add_argument(
         '--mask_loss',
         type=str,
@@ -275,12 +300,20 @@ def main():
         'mask_ratio': args.mask_ratio,
         'mask_min_dist': args.mask_min_dist,
         'lattice_random_phase': args.lattice_random_phase,
+        'random_patch_coordinates': args.random_patch_coordinates,
         'slice_axis': args.slice_axis,
         'fmap': args.fmap,
         'backbone': args.backbone,
         'representation': args.representation,
         'dtcwt_dim': args.dtcwt_dim,
         'dtcwt_levels': args.dtcwt_levels,
+        'dtcwt_channel_normalize': args.dtcwt_channel_normalize,
+        'adaptive_grad_clip': args.adaptive_grad_clip,
+        'grad_clip_warmup_iters': args.grad_clip_warmup_iters,
+        'grad_clip_percentile': args.grad_clip_percentile,
+        'grad_clip_warmup_cap': args.grad_clip_warmup_cap,
+        'grad_clip_median_multiplier': args.grad_clip_median_multiplier,
+        'diagnostic_interval': args.diagnostic_interval,
         'srdtrans_root': args.srdtrans_root,
         'embedding_dim': args.embedding_dim,
         'num_heads': args.num_heads,
@@ -309,6 +342,7 @@ def main():
         'space_post_norm': args.space_post_norm,
         'space_dropout_rate': args.space_dropout_rate,
         'use_msconv_before_trans': args.use_msconv_before_trans,
+        'gradient_checkpointing': args.gradient_checkpointing,
         'mask_loss': args.mask_loss,
         'kappa_mode': args.kappa_mode,
         'mpgn_alpha': args.mpgn_alpha,
@@ -328,7 +362,11 @@ def main():
         'eval_ckpt': args.eval_ckpt,
     }
 
-    tc = training_class_srdtrans_gamma(train_dict)
+    if args.pure_network:
+        train_dict['mask_loss'] = 'l1l2'
+        tc = training_class_srdtrans(train_dict)
+    else:
+        tc = training_class_srdtrans_gamma(train_dict)
     tc.run()
 
 

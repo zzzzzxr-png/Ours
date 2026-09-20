@@ -10,6 +10,7 @@ Differences from posterior.trainer (unroll-transformer pipeline):
 """
 
 import datetime
+import csv
 import glob
 import math
 import os
@@ -25,6 +26,7 @@ import torch.nn as nn
 import yaml
 from skimage import io
 from torch.utils.data import DataLoader
+from representation import DTCWT2D
 
 from .dataset import (
     multibatch_test_save_srdtrans,
@@ -35,7 +37,11 @@ from .dataset import (
     trainset_srdtrans,
     trainset_temporal_srdtrans,
 )
-from .backbone_factory import DEFAULT_SRDTRANS_ROOT, build_denoise_network_srdtrans
+from .backbone_factory import (
+    DEFAULT_SRDTRANS_ROOT,
+    DTCWTComplexBackbone,
+    build_denoise_network_srdtrans,
+)
 from .sampling import generate_mask_pair, generate_subimages
 from .losses import (
     l1_l2_loss,
@@ -62,10 +68,183 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _estimate_fixed_dtcwt_scales(stacks, levels, chunk_frames=32):
+    """One fixed RMS per DTCWT scale from the centered training stacks."""
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(min(4, previous_threads))
+    transform = DTCWT2D(levels=levels)
+    square_sums = [0.0] * (levels + 1)
+    counts = [0] * (levels + 1)
+    divisor = 2 ** levels
+    with torch.no_grad():
+        for stack in stacks:
+            height = stack.shape[-2] // divisor * divisor
+            width = stack.shape[-1] // divisor * divisor
+            top = (stack.shape[-2] - height) // 2
+            left = (stack.shape[-1] - width) // 2
+            for start in range(0, stack.shape[0], chunk_frames):
+                block = np.ascontiguousarray(
+                    stack[start:start + chunk_frames, top:top + height, left:left + width]
+                )
+                value = torch.from_numpy(block)[None, None]
+                coefficients = transform(value)
+                branches = (coefficients.low,) + coefficients.highs
+                for index, branch in enumerate(branches):
+                    square_sums[index] += float(branch.abs().square().sum())
+                    counts[index] += branch.numel()
+    scales = [math.sqrt(total / count) for total, count in zip(square_sums, counts)]
+    if not all(math.isfinite(scale) and scale > 0 for scale in scales):
+        raise RuntimeError('failed to estimate finite positive DTCWT scales')
+    torch.set_num_threads(previous_threads)
+    return scales
+
+
+def _adaptive_clip_grad_(parameters, warmup_norms, threshold, warmup_iters,
+                         percentile, warmup_cap, median_multiplier):
+    """Clip safely while calibrating, then use the fixed warmup percentile."""
+    cap = warmup_cap if threshold is None else threshold
+    total_norm = torch.nn.utils.clip_grad_norm_(
+        parameters, max_norm=cap, error_if_nonfinite=True)
+    if threshold is None:
+        warmup_norms.append(float(total_norm.detach()))
+        if len(warmup_norms) == warmup_iters:
+            threshold = min(
+                float(np.percentile(warmup_norms, percentile)),
+                float(median_multiplier) * float(np.median(warmup_norms)),
+            )
+    return total_norm, threshold
+
+
 def _bind_visible_gpu(gpu: str) -> None:
     """Bind process to physical GPU(s) before any CUDA init (must run before cuda calls)."""
     if 'CUDA_VISIBLE_DEVICES' not in os.environ:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
+
+
+def _diagnostic_parameter_group(name):
+    """Collapse SRDTrans parameters into stages useful for instability diagnosis."""
+    parts = name.split('.')
+    if len(parts) >= 3 and parts[0] == 'backbone':
+        if parts[1] in ('encoders', 'decoders', 'layers'):
+            return '{}.{}'.format(parts[1], parts[2])
+        if parts[1] in ('branch_encoders', 'branch_decoders'):
+            return '{}.{}.{}'.format(parts[1], parts[2], parts[3])
+        if parts[1] in ('conv_before_trans', 'conv_after_trans'):
+            return parts[1]
+    return parts[0]
+
+
+def _tensor_rms(value):
+    if isinstance(value, (tuple, list)):
+        square_sum = sum(item.detach().abs().square().sum() for item in value)
+        count = sum(item.numel() for item in value)
+        return float((square_sum / count).sqrt().cpu())
+    return float(value.detach().abs().square().mean().sqrt().cpu())
+
+
+class _TrainingDiagnostics:
+    """Sparse stage activations and per-stage optimizer-update diagnostics."""
+
+    def __init__(self, model, path, interval):
+        self.model = model.module if isinstance(model, nn.DataParallel) else model
+        self.path = path
+        self.interval = int(interval)
+        self.enabled = False
+        self.activations = {}
+        self.handles = []
+        self._register_hooks()
+        with open(self.path, 'w', newline='') as f:
+            csv.writer(f).writerow([
+                'iter', 'kind', 'name', 'value', 'loss', 'param_norm',
+                'grad_norm', 'update_norm', 'update_ratio',
+            ])
+
+    def _save_activation(self, name, value):
+        if self.enabled:
+            self.activations[name] = _tensor_rms(value)
+
+    def _save_encoder(self, index, output):
+        self._save_activation('encoders.{}.skip'.format(index), output[0])
+        self._save_activation('encoders.{}.down'.format(index), output[1])
+
+    def _register_hooks(self):
+        if not isinstance(self.model, DTCWTComplexBackbone):
+            raise TypeError('training diagnostics require DTCWTComplexBackbone')
+        core = self.model.backbone
+        self.handles.append(core.register_forward_pre_hook(
+            lambda _, inputs: self._save_activation('dtcwt_input', inputs[0])))
+        for index, module in enumerate(core.encoders):
+            self.handles.append(module.register_forward_hook(
+                lambda _, __, output, i=index: self._save_encoder(i, output)))
+        for name in ('conv_before_trans', 'conv_after_trans'):
+            module = getattr(core, name)
+            self.handles.append(module.register_forward_hook(
+                lambda _, __, output, n=name: self._save_activation(n, output)))
+        for index, module in enumerate(core.layers):
+            self.handles.append(module.register_forward_hook(
+                lambda _, __, output, i=index: self._save_activation(
+                    'layers.{}'.format(i), output)))
+        for index, module in enumerate(core.decoders):
+            self.handles.append(module.register_forward_hook(
+                lambda _, __, output, i=index: self._save_activation(
+                    'decoders.{}'.format(i), output)))
+        self.handles.append(core.register_forward_hook(
+            lambda _, __, output: self._save_activation('dtcwt_output', output)))
+        self.handles.append(self.model.register_forward_hook(
+            lambda _, __, output: self._save_activation('image_output', output)))
+
+    def begin(self, iteration):
+        self.enabled = iteration == 1 or iteration % self.interval == 0
+        if self.enabled:
+            self.activations.clear()
+            return {
+                name: parameter.detach().clone()
+                for name, parameter in self.model.named_parameters()
+                if parameter.requires_grad
+            }
+        return None
+
+    @staticmethod
+    def _norms_by_group(named_values):
+        sums = {}
+        for name, value in named_values:
+            if value is None:
+                continue
+            group = _diagnostic_parameter_group(name)
+            sums[group] = sums.get(group, 0.0) + float(
+                value.detach().abs().square().sum().cpu())
+        return {name: math.sqrt(value) for name, value in sums.items()}
+
+    def finish(self, iteration, loss, before):
+        parameters = list(self.model.named_parameters())
+        param_norms = self._norms_by_group(parameters)
+        grad_norms = self._norms_by_group(
+            (name, parameter.grad) for name, parameter in parameters)
+        update_norms = self._norms_by_group(
+            (name, parameter.detach() - before[name])
+            for name, parameter in parameters
+        )
+        with open(self.path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerows(
+                [iteration, 'activation_rms', name, value, loss, '', '', '', '']
+                for name, value in sorted(self.activations.items())
+            )
+            for name in sorted(param_norms):
+                param_norm = param_norms[name]
+                update_norm = update_norms.get(name, 0.0)
+                writer.writerow([
+                    iteration, 'parameter', name, '', loss, param_norm,
+                    grad_norms.get(name, 0.0), update_norm, update_norm / max(param_norm, 1e-30),
+                ])
+        self.enabled = False
+
+    def save_failure(self, iteration):
+        torch.save(
+            self.model.state_dict(),
+            os.path.join(os.path.dirname(self.path),
+                         'diagnostic_last_finite_iter_{:04d}.pth'.format(iteration - 1)),
+        )
 
 def cal_snr_srdtrans(noisy_img: np.ndarray, clean_img: np.ndarray) -> float:
     noise_signal_2 = (noisy_img.astype(np.float32) - clean_img.astype(np.float32)) ** 2
@@ -106,6 +285,11 @@ class training_class_srdtrans:
         self.select_img_num = 100000
         self.num_workers = 4
         self.backbone = 'srdtrans_v2'
+        self.representation = 'dtcwt'
+        self.dtcwt_dim = 2
+        self.dtcwt_levels = 3
+        self.dtcwt_channel_normalize = False
+        self.dtcwt_channel_scales = None
         self.sampling_mode = 'spatial'
         # Full-resolution directional masked self-supervision.
         # spatial_mask / temporal_mask keep input shape [B, C, T, H, W] unchanged
@@ -113,6 +297,7 @@ class training_class_srdtrans:
         self.mask_ratio = 0.01
         self.mask_min_dist = 3
         self.lattice_random_phase = True
+        self.random_patch_coordinates = False
         self.slice_axis = 'random'
         self.srdtrans_root = DEFAULT_SRDTRANS_ROOT
         self.embedding_dim = 128
@@ -134,6 +319,7 @@ class training_class_srdtrans:
         self.space_post_norm = False
         self.space_dropout_rate = 0.0
         self.use_msconv_before_trans = False
+        self.gradient_checkpointing = True
         self.mask_loss = 'l1l2'
         self.mpgn_alpha = 5000.0
         self.mpgn_beta = 1600.0
@@ -152,6 +338,12 @@ class training_class_srdtrans:
         self.save_test_images_per_epoch = True
         self.visualize_images_per_epoch = False
         self.seed = 1024
+        self.adaptive_grad_clip = False
+        self.grad_clip_warmup_iters = 1000
+        self.grad_clip_percentile = 95.0
+        self.grad_clip_warmup_cap = 1e8
+        self.grad_clip_median_multiplier = 2.0
+        self.diagnostic_interval = 0
         self._eval_cache_ready = False
         self.set_params(params_dict)
 
@@ -219,8 +411,33 @@ class training_class_srdtrans:
         return best_path, best_key[0], best_key[1]
 
     def _try_resume_checkpoint(self):
-        """Load latest model weights; continue from the next epoch index."""
+        """Load latest model/optimizer state; continue from the next epoch."""
         self._resume_start_epoch = 0
+        self._resume_global_iter = 0
+        self._resume_optimizer_state = None
+
+        latest_path = os.path.join(self.pth_path, 'latest.pth')
+        if os.path.isfile(latest_path):
+            state = torch.load(latest_path, map_location='cpu', weights_only=False)
+            model_state = state.get('model_state_dict')
+            optimizer_state = state.get('optimizer_state_dict')
+            if model_state is not None and optimizer_state is not None:
+                if isinstance(self.local_model, nn.DataParallel):
+                    self.local_model.module.load_state_dict(model_state)
+                else:
+                    self.local_model.load_state_dict(model_state)
+                self._resume_optimizer_state = optimizer_state
+                self._resume_start_epoch = int(state['next_epoch'])
+                self._resume_global_iter = int(state.get('global_iter', 0))
+                print(
+                    '\033[1;31mResume latest checkpoint -----> \033[0m{} '
+                    '(next epoch {}, global_iter {})'.format(
+                        latest_path, self._resume_start_epoch + 1,
+                        self._resume_global_iter,
+                    )
+                )
+                return True
+
         found = self._find_latest_checkpoint()
         if found is None:
             return False
@@ -274,13 +491,20 @@ class training_class_srdtrans:
             'lr', 'b1', 'b2', 'fmap', 'select_img_num',
             'train_datasets_size', 'overlap_factor', 'val_overlap_factor',
             'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'backbone',
+            'representation', 'dtcwt_dim', 'dtcwt_levels', 'dtcwt_channel_normalize',
+            'dtcwt_channel_scales',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate',             'srdtrans_f_maps', 'input_dropout_rate',
             'temporal_strides', 'last_squeeze_op', 'freq_aware', 'ftvsr_enc1', 'enc_d2', 'upsample_mode', 'init_ckpt',
             'sampling_mode',
-            'mask_ratio', 'mask_min_dist', 'lattice_random_phase', 'slice_axis', 'seed',
+            'mask_ratio', 'mask_min_dist', 'lattice_random_phase',
+            'random_patch_coordinates', 'slice_axis', 'seed',
             'trans_order', 'space_post_norm', 'space_dropout_rate',
-            'use_msconv_before_trans', 'mask_loss',
+            'use_msconv_before_trans', 'gradient_checkpointing', 'mask_loss',
+            'adaptive_grad_clip', 'grad_clip_warmup_iters',
+            'grad_clip_percentile', 'grad_clip_warmup_cap',
+            'grad_clip_median_multiplier',
+            'diagnostic_interval',
             'mpgn_alpha', 'mpgn_beta', 'mpgn_offset', 'mpgn_kmax', 'mpgn_nll_chunk_t',
             'mpgn_quant_step', 'mpgn_clip_low', 'mpgn_clip_high', 'mpgn_boundary_atol',
         )}
@@ -352,8 +576,29 @@ class training_class_srdtrans:
         self._eval_cache_ready = True
 
     def train(self):
+        if self.adaptive_grad_clip:
+            if int(self.grad_clip_warmup_iters) <= 0:
+                raise ValueError('grad_clip_warmup_iters must be positive')
+            if not 0.0 < float(self.grad_clip_percentile) <= 100.0:
+                raise ValueError('grad_clip_percentile must be in (0, 100]')
+            if float(self.grad_clip_warmup_cap) <= 0.0:
+                raise ValueError('grad_clip_warmup_cap must be positive')
+            if float(self.grad_clip_median_multiplier) <= 0.0:
+                raise ValueError('grad_clip_median_multiplier must be positive')
         optimizer_G = torch.optim.Adam(
             self.local_model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
+        if getattr(self, '_resume_optimizer_state', None) is not None:
+            optimizer_G.load_state_dict(self._resume_optimizer_state)
+            print('Resume Adam optimizer state -----> loaded')
+        diagnostics = None
+        if int(getattr(self, 'diagnostic_interval', 0)) > 0:
+            diagnostics = _TrainingDiagnostics(
+                self.local_model,
+                os.path.join(self.pth_path, 'training_diagnostics.csv'),
+                int(self.diagnostic_interval),
+            )
+        warmup_grad_norms = []
+        grad_clip_threshold = None
         cuda = torch.cuda.is_available()
 
         prev_time = time.time()
@@ -395,6 +640,10 @@ class training_class_srdtrans:
                     self.train_stack_index,
                     return_stack_mean=use_nll,
                     stack_means=getattr(self, 'train_stack_means', None),
+                    coordinate_seed=(
+                        int(self.seed or 0) + epoch * len(self.train_name_list)
+                        if self.random_patch_coordinates else None
+                    ),
                 )
             trainloader = DataLoader(
                 train_data,
@@ -405,9 +654,14 @@ class training_class_srdtrans:
                 worker_init_fn=worker_init_fn,
             )
             if epoch == start_epoch and start_epoch > 0:
-                global_iter = start_epoch * len(trainloader)
+                global_iter = getattr(
+                    self, '_resume_global_iter', start_epoch * len(trainloader)
+                )
 
             for iteration, batch in enumerate(trainloader):
+                diagnostic_before = (
+                    diagnostics.begin(global_iter + 1) if diagnostics else None
+                )
                 if self.sampling_mode == 'temporal':
                     inp, tgt = batch
                     if cuda:
@@ -506,10 +760,63 @@ class training_class_srdtrans:
                     loss_b = l1_l2_loss(noisy_output, noisy_sub3)
                     total_loss = 0.5 * loss_a + 0.5 * loss_b
 
+                if diagnostics and not bool(torch.isfinite(total_loss).item()):
+                    diagnostics.save_failure(global_iter + 1)
+                    raise FloatingPointError(
+                        'non-finite loss at global iteration {}'.format(global_iter + 1))
+
                 optimizer_G.zero_grad()
                 total_loss.backward()
+                if diagnostics:
+                    try:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.local_model.parameters(),
+                            max_norm=float('inf'),
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError:
+                        diagnostics.save_failure(global_iter + 1)
+                        raise
+                if self.adaptive_grad_clip:
+                    previous_threshold = grad_clip_threshold
+                    grad_norm, grad_clip_threshold = _adaptive_clip_grad_(
+                        self.local_model.parameters(),
+                        warmup_grad_norms,
+                        grad_clip_threshold,
+                        int(self.grad_clip_warmup_iters),
+                        float(self.grad_clip_percentile),
+                        float(self.grad_clip_warmup_cap),
+                        float(self.grad_clip_median_multiplier),
+                    )
+                    if previous_threshold is None and grad_clip_threshold is not None:
+                        calibration = {
+                            'warmup_iters': len(warmup_grad_norms),
+                            'percentile': float(self.grad_clip_percentile),
+                            'percentile_value': float(np.percentile(
+                                warmup_grad_norms, self.grad_clip_percentile)),
+                            'median_multiplier': float(
+                                self.grad_clip_median_multiplier),
+                            'threshold': grad_clip_threshold,
+                            'median': float(np.median(warmup_grad_norms)),
+                            'maximum': float(np.max(warmup_grad_norms)),
+                        }
+                        with open(os.path.join(
+                                self.pth_path, 'grad_clip_calibration.yaml'), 'w') as f:
+                            yaml.safe_dump(calibration, f, sort_keys=False)
+                        print(
+                            '\nAdaptive gradient clip calibrated: '
+                            'P{:.1f}={:.6g}, median={:.6g}, max={:.6g}'.format(
+                                float(self.grad_clip_percentile),
+                                grad_clip_threshold,
+                                calibration['median'],
+                                calibration['maximum'],
+                            )
+                        )
                 optimizer_G.step()
                 global_iter += 1
+                if diagnostic_before is not None:
+                    diagnostics.finish(
+                        global_iter, float(total_loss.detach().cpu()), diagnostic_before)
 
                 batches_left = self.n_epochs * len(trainloader) - (
                     epoch * len(trainloader) + iteration)
@@ -540,7 +847,7 @@ class training_class_srdtrans:
 
                 if (iteration + 1) % len(trainloader) == 0:
                     print('\n', end=' ')
-                    self.save_model(epoch, iteration)
+                    self.save_model(epoch, iteration, optimizer_G, global_iter)
                     if getattr(self, 'eval_val_per_epoch', False) and int(
                             getattr(self, 'eval_every_iters', 0)) <= 0:
                         print('Validation ----->')
@@ -548,16 +855,29 @@ class training_class_srdtrans:
                         self.local_model.train()
                     print('\n', end=' ')
 
-    def save_model(self, epoch, iteration):
+    def save_model(self, epoch, iteration, optimizer=None, global_iter=None):
         os.makedirs(self.pth_path, exist_ok=True)
         model_save_name = os.path.join(
             self.pth_path,
             'E_{}_Iter_{}.pth'.format(str(epoch + 1).zfill(2), str(iteration + 1).zfill(4)),
         )
         if isinstance(self.local_model, nn.DataParallel):
-            torch.save(self.local_model.module.state_dict(), model_save_name)
+            model_state = self.local_model.module.state_dict()
         else:
-            torch.save(self.local_model.state_dict(), model_save_name)
+            model_state = self.local_model.state_dict()
+        torch.save(model_state, model_save_name)
+
+        if optimizer is not None:
+            latest_path = os.path.join(self.pth_path, 'latest.pth')
+            latest_tmp = latest_path + '.tmp'
+            torch.save({
+                'format_version': 1,
+                'model_state_dict': model_state,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'next_epoch': epoch + 1,
+                'global_iter': int(global_iter if global_iter is not None else 0),
+            }, latest_tmp)
+            os.replace(latest_tmp, latest_path)
 
     def test(self, train_epoch, train_iteration):
         """SRDTrans test.py stitching + DeepCAD GT SNR metrics."""
@@ -728,6 +1048,14 @@ class training_class_srdtrans:
             self.train_stack_index,
             self.train_stack_means,
         ) = train_preprocess_lessMemoryMulStacks_srdtrans(train_args)
+        if self.dtcwt_channel_normalize:
+            self.dtcwt_channel_scales = _estimate_fixed_dtcwt_scales(
+                self.train_noise_img, int(self.dtcwt_levels)
+            )
+            print('Fixed global DTCWT scales -----> {}'.format(
+                ', '.join('{:.6f}'.format(value)
+                          for value in self.dtcwt_channel_scales)
+            ))
         self.save_yaml_train()
         self.initialize_network()
         self.distribute_GPU()

@@ -54,6 +54,24 @@ def random_transform_pair_srdtrans(input_arr, target_arr):
     return apply(input_arr), apply(target_arr)
 
 
+def _random_coordinate(noise_img, coordinate, seed):
+    """Draw a reproducible crop of the same size anywhere in one stack."""
+    rng = random.Random(int(seed))
+    size_t = coordinate['end_s'] - coordinate['init_s']
+    size_h = coordinate['end_h'] - coordinate['init_h']
+    size_w = coordinate['end_w'] - coordinate['init_w']
+    if size_t > noise_img.shape[0] or size_h > noise_img.shape[1] or size_w > noise_img.shape[2]:
+        raise ValueError('patch size exceeds stack shape')
+    init_s = rng.randint(0, noise_img.shape[0] - size_t)
+    init_h = rng.randint(0, noise_img.shape[1] - size_h)
+    init_w = rng.randint(0, noise_img.shape[2] - size_w)
+    return {
+        'init_s': init_s, 'end_s': init_s + size_t,
+        'init_h': init_h, 'end_h': init_h + size_h,
+        'init_w': init_w, 'end_w': init_w + size_w,
+    }
+
+
 def _im_folder(args):
   folder = getattr(args, 'datasets_folder', None) or args.datasets_path
   return os.path.abspath(folder)
@@ -169,17 +187,22 @@ class trainset_srdtrans(Dataset):
     """Port of SRDTrans trainset (spatial-neighbor masking input)."""
 
     def __init__(self, name_list, coordinate_list, noise_img_all, stack_index,
-                 return_stack_mean: bool = False, stack_means=None):
+                 return_stack_mean: bool = False, stack_means=None,
+                 coordinate_seed=None):
         self.name_list = name_list
         self.coordinate_list = coordinate_list
         self.noise_img_all = noise_img_all
         self.stack_index = stack_index
         self.return_stack_mean = return_stack_mean
         self.stack_means = stack_means
+        self.coordinate_seed = coordinate_seed
 
     def __getitem__(self, index):
         noise_img = self.noise_img_all[self.stack_index[index]]
         single_coordinate = self.coordinate_list[self.name_list[index]]
+        if self.coordinate_seed is not None:
+            single_coordinate = _random_coordinate(
+                noise_img, single_coordinate, int(self.coordinate_seed) + index)
         init_h = single_coordinate['init_h']
         end_h = single_coordinate['end_h']
         init_w = single_coordinate['init_w']

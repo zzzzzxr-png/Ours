@@ -4,6 +4,8 @@ from torch.nn import functional as F
 import complextorch.nn as cvnn
 from torch.utils.checkpoint import checkpoint
 
+from SRDTrans_v2.complex_layers import ComplexRMSNorm3d
+
 
 class MSConvBeforeTrans(nn.Module):
     """
@@ -34,6 +36,7 @@ class MSConvBeforeTrans(nn.Module):
                 kernel_size=(3, 3, 3),
                 padding=(1, 1, 1)
             ),
+            ComplexRMSNorm3d(),
             cvnn.modReLU()
         )
 
@@ -44,6 +47,7 @@ class MSConvBeforeTrans(nn.Module):
                 kernel_size=(1, 3, 3),
                 padding=(0, 1, 1)
             ),
+            ComplexRMSNorm3d(),
             cvnn.modReLU()
         )
 
@@ -55,11 +59,13 @@ class MSConvBeforeTrans(nn.Module):
                 padding=(0, 2, 2),
                 dilation=(1, 2, 2)
             ),
+            ComplexRMSNorm3d(),
             cvnn.modReLU()
         )
 
         self.fuse = nn.Sequential(
             cvnn.Conv3d(out_channels, out_channels, kernel_size=1),
+            ComplexRMSNorm3d(),
             cvnn.modReLU()
         )
 
@@ -89,6 +95,7 @@ class MainFrame(nn.Module):
         self.img_dim = img_dim
         self.img_time = img_time
         self.f_maps = f_maps
+        self.gradient_checkpointing = True
         # 2Conv + Down
         self.encoders = self.temporalSqueeze(
             f_maps=[in_channel] + f_maps
@@ -127,20 +134,20 @@ class MainFrame(nn.Module):
     def forward(self, x):
         encoders_features = []
         for encoder in self.encoders:
-            if self.training and torch.is_grad_enabled():
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
                 before_down, x = checkpoint(encoder, x, use_reentrant=False)
             else:
                 before_down, x = encoder(x)
             # reverse the encoder outputs to be aligned with the decoder
             encoders_features.insert(0, before_down)
 
-        if self.training and torch.is_grad_enabled():
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             x = checkpoint(self.process_by_trans, x, use_reentrant=False)
         else:
             x = self.process_by_trans(x)
 
         for decoder, encoder_features in zip(self.decoders, encoders_features):
-            if self.training and torch.is_grad_enabled():
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
                 x = checkpoint(decoder, x, encoder_features, use_reentrant=False)
             else:
                 x = decoder(x, encoder_features)
@@ -163,10 +170,11 @@ class SqueezeLayer(nn.Module):
             if_encoder=True
         )
         self.down_sample = cvnn.Conv3d(out_channels, out_channels, kernel_size=(3,3,3), stride=(2,1,1), padding=(1,1,1))
+        self.down_norm = ComplexRMSNorm3d()
 
     def forward(self, x):
         before_down = self.conv_net(x)
-        x = self.down_sample(before_down)
+        x = self.down_norm(self.down_sample(before_down))
         return before_down, x
 
 
@@ -187,11 +195,12 @@ class ExcitationLayer(nn.Module):
         )
         self.if_up_sample = if_up_sample
         self.up_sample = cvnn.ConvTranspose3d(in_channels=in_channels, out_channels=in_channels, kernel_size=(4,3,3), stride=(2,1,1), padding=(1,1,1))
+        self.up_norm = ComplexRMSNorm3d()
 
     def forward(self, x, encoder_features):
         if self.if_up_sample:
-            x = self.up_sample(x)
-        x += encoder_features
+            x = self.up_norm(self.up_sample(x))
+        x = (x + encoder_features) * (2 ** -0.5)
         # x = torch.cat((encoder_features, x), dim=2)
         x = self.conv_net(x)
         return x
@@ -209,6 +218,7 @@ class SingleConv(nn.Sequential):
         super(SingleConv, self).__init__()
         self.add_module('ComplexConv3d',
                         cvnn.Conv3d(in_channels, out_channels, kernel_size, padding=padding, stride=stride))
+        self.add_module('ComplexRMSNorm3d', ComplexRMSNorm3d())
         self.add_module('modReLU', cvnn.modReLU())
 
 

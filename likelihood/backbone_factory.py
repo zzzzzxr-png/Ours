@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from prior.deepcadrt import Network_3D_Unet
-from representation import DTCWT2D, DTCWTScaleAdapter
+from representation import DTCWT2D, LearnedDTCWTScaleAdapter
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DEFAULT_SRDTRANS_ROOT = os.path.join(_PROJECT_ROOT, 'prior', 'srdtrans', 'SRDTrans_v2')
@@ -49,14 +49,28 @@ class LearnedKappaHead(nn.Module):
 
 
 class DTCWTComplexBackbone(nn.Module):
-    """Real video -> DTCWT/adapters -> unchanged complex SRDTrans -> real video."""
+    """Real video -> learned DTCWT adapter -> complex SRDTrans -> real video."""
 
     def __init__(self, backbone: nn.Module, levels=3, image_channels=1,
+                 channel_normalize=False, channel_scales=None,
                  biort='near_sym_b', qshift='qshift_b'):
         super().__init__()
         self.backbone = backbone
         self.representation = DTCWT2D(levels=levels, biort=biort, qshift=qshift)
-        self.adapter = DTCWTScaleAdapter(image_channels=image_channels, levels=levels)
+        self.adapter = LearnedDTCWTScaleAdapter(
+            image_channels=image_channels, levels=levels
+        )
+        self.channel_normalize = bool(channel_normalize)
+        if self.channel_normalize:
+            if channel_scales is None or len(channel_scales) != levels + 1:
+                raise ValueError('fixed DTCWT normalization needs {} branch scales'.format(
+                    levels + 1))
+            scales = torch.as_tensor(channel_scales, dtype=torch.float32)
+            if not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
+                raise ValueError('fixed DTCWT branch scales must be finite and positive')
+        else:
+            scales = torch.ones(levels + 1, dtype=torch.float32)
+        self.register_buffer('channel_scales', scales)
 
     def forward(self, x):
         if x.ndim != 5 or x.shape[1] != 1 or x.is_complex():
@@ -66,18 +80,29 @@ class DTCWTComplexBackbone(nn.Module):
                 )
             )
         coefficients = self.representation(x)
+        branches = (coefficients.low,) + coefficients.highs
+        if self.channel_normalize:
+            branches = tuple(
+                value / self.channel_scales[index].to(value.dtype)
+                for index, value in enumerate(branches)
+            )
+            coefficients = type(coefficients)(
+                branches[0], tuple(branches[1:]), coefficients.spatial_size,
+                coefficients.image_channels,
+            )
         features = self.adapter.encode(coefficients)
         predicted = self.backbone(features)
         if predicted.shape != features.shape or not predicted.is_complex():
-            raise RuntimeError(
-                'complex SRDTrans changed DTCWT feature shape/dtype: {} {} -> {} {}'.format(
-                    tuple(features.shape), features.dtype,
-                    tuple(predicted.shape), predicted.dtype,
-                )
+            raise RuntimeError('complex SRDTrans changed aligned DTCWT feature shape')
+        predicted = self.adapter.decode(predicted, coefficients)
+        if self.channel_normalize:
+            predicted = type(predicted)(
+                predicted.low * self.channel_scales[0].to(predicted.low.dtype),
+                tuple(value * self.channel_scales[index + 1].to(value.dtype)
+                      for index, value in enumerate(predicted.highs)),
+                predicted.spatial_size, predicted.image_channels,
             )
-        return self.representation.inverse(
-            self.adapter.decode(predicted, coefficients)
-        )
+        return self.representation.inverse(predicted)
 
 
 def ensure_srdtrans_repo_on_path(srdtrans_root=None):
@@ -148,7 +173,9 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     levels = int(getattr(cfg, 'dtcwt_levels', 3))
     coefficient_dim = int(cfg.patch_x) // 2
     coefficient_channels = 2 + 6 * levels
-    f_maps[0] = coefficient_channels
+    f_maps[0] = max(coefficient_channels, f_maps[0])
+    for index in range(1, len(f_maps)):
+        f_maps[index] = max(f_maps[index - 1], f_maps[index])
 
     model = ModelClass(
         img_dim=coefficient_dim,
@@ -167,15 +194,20 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
         space_dropout_rate=space_dropout_rate,
         use_msconv_before_trans=use_msconv_before_trans,
     )
+    model.gradient_checkpointing = bool(
+        getattr(cfg, 'gradient_checkpointing', True)
+    )
     param_num = sum(p.numel() for p in model.parameters())
     print(
         '\033[1;31mSRDTrans protocol / SRDTrans_v2 img_dim={} img_time={} '
-        'trans_order={} msconv={} space_post_norm={} params={:.2f}M\033[0m'.format(
+        'trans_order={} msconv={} space_post_norm={} checkpoint={} '
+        'params={:.2f}M\033[0m'.format(
             coefficient_dim,
             int(cfg.patch_t),
             trans_order,
             use_msconv_before_trans,
             space_post_norm,
+            model.gradient_checkpointing,
             param_num / 1e6,
         )
     )
@@ -217,6 +249,10 @@ def build_denoise_network_srdtrans(cfg):
         model = DTCWTComplexBackbone(
             _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2),
             levels=levels,
+            channel_normalize=bool(
+                getattr(cfg, 'dtcwt_channel_normalize', False)
+            ),
+            channel_scales=getattr(cfg, 'dtcwt_channel_scales', None),
             biort=getattr(cfg, 'dtcwt_biort', 'near_sym_b'),
             qshift=getattr(cfg, 'dtcwt_qshift', 'qshift_b'),
         )

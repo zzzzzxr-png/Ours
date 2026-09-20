@@ -10,7 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from representation.dtcwt import DTCWT2D, pack_low, unpack_low  # noqa: E402
-from representation.dtcwt_adapter import DTCWTScaleAdapter, _block_mean, _repeat_to  # noqa: E402
+from representation.dtcwt_adapter import (  # noqa: E402
+    DTCWTScaleAdapter,
+    LearnedDTCWTScaleAdapter,
+    _block_mean,
+    _repeat_to,
+)
 
 
 def main():
@@ -39,6 +44,14 @@ def main():
     decoded = adapter.decode(features, coefficients)
     assert torch.equal(decoded.low, coefficients.low)
     assert all(torch.equal(a, b) for a, b in zip(decoded.highs, coefficients.highs))
+
+    learned = LearnedDTCWTScaleAdapter(levels=3)
+    assert next(learned.analysis_heads[1].parameters(), None) is not None
+    assert next(learned.synthesis_heads[1].parameters(), None) is not None
+    learned_decoded = learned.decode(learned.encode(coefficients), coefficients)
+    assert torch.allclose(learned_decoded.low, coefficients.low, atol=1e-6)
+    assert all(torch.allclose(a, b, atol=1e-6)
+               for a, b in zip(learned_decoded.highs, coefficients.highs))
 
     reconstructed.square().mean().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
