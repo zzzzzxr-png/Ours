@@ -114,6 +114,11 @@ def parse_args():
     parser.add_argument('--attn-dropout-rate', type=float, default=0.1)
     parser.add_argument('--input-dropout-rate', type=float, default=0.0)
     parser.add_argument('--srdtrans-f-maps', type=str, default='8,16,32,64')
+    parser.add_argument('--skip-fusion', choices=['add', 'gated_add', 'conv_add'],
+                        default='add',
+                        help='Complex decoder skip fusion; add preserves the baseline.')
+    parser.add_argument('--interleaved-transformer', action='store_true',
+                        help='Use spatial-temporal-spatial-temporal transformer ordering.')
     parser.add_argument('--temporal_strides', type=str, default=None,
                         help='Comma-separated temporal strides for SRDTrans backbone '
                              '(e.g. 2,2,2,2); ignored for other backbones')
@@ -122,6 +127,8 @@ def parse_args():
                         help='Downsampling operator for the last temporal SqueezeLayer only')
 
     parser.add_argument('--gpu', type=str, default='0')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Per-process batch size; default is the number of visible GPUs.')
     parser.add_argument('--smoke-test-multigpu', action='store_true',
                         help='Run one synthetic DDP forward/backward step and exit')
     parser.add_argument('--num_workers', type=int, default=4)
@@ -323,9 +330,12 @@ def main():
         'attn_dropout_rate': args.attn_dropout_rate,
         'input_dropout_rate': args.input_dropout_rate,
         'srdtrans_f_maps': srdtrans_f_maps,
+        'skip_fusion': args.skip_fusion,
+        'interleaved_transformer': args.interleaved_transformer,
         'temporal_strides': temporal_strides,
         'last_squeeze_op': args.last_squeeze_op,
         'GPU': args.gpu,
+        'batch_size': args.batch_size,
         'smoke_test_multigpu': args.smoke_test_multigpu,
         'num_workers': args.num_workers,
         'select_img_num': args.select_img_num,

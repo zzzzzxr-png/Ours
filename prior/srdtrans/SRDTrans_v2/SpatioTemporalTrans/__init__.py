@@ -20,6 +20,8 @@ class TemporalTransformer(nn.Module):
             hidden_dim,
             input_dropout_rate,
             attn_dropout_rate,
+            add_position=True,
+            final_norm=True,
     ):
         super(TemporalTransformer, self).__init__()
         self.transformer = TemporalTransLayer(
@@ -30,16 +32,19 @@ class TemporalTransformer(nn.Module):
             dropout_rate=input_dropout_rate,
             attn_dropout_rate=attn_dropout_rate,
         )
-        self.position_encoding = LearnedPositionalEncoding(
-            embedding_dim, seq_length
+        self.add_position = bool(add_position)
+        self.position_encoding = (
+            LearnedPositionalEncoding(embedding_dim, seq_length)
+            if self.add_position else None
         )
         self.pre_dropout = SharedDropout(input_dropout_rate)
-        self.pre_head_ln = cvnn.LayerNorm(embedding_dim)
+        self.pre_head_ln = cvnn.LayerNorm(embedding_dim) if final_norm else nn.Identity()
 
     def forward(self, x):
         B, C, D, H, W = x.size()
         x = rearrange(x, 'b c s h w -> (b h w) s c')
-        x = self.position_encoding(x)
+        if self.add_position:
+            x = self.position_encoding(x)
         x = self.pre_dropout(x)
         x = self.transformer(x)
         x = self.pre_head_ln(x)
@@ -58,6 +63,7 @@ class SpatioTransformer(nn.Module):
             attn_drop=0.,
             input_drop=0.,
             post_norm=False,
+            shift_size=None,
     ):
         super(SpatioTransformer, self).__init__()
         self.transformer = SpatioTransLayer(
@@ -72,6 +78,7 @@ class SpatioTransformer(nn.Module):
             attn_drop=attn_drop,
             drop_path=0.,
             norm_layer=cvnn.LayerNorm,
+            shift_size=shift_size,
         )
 
         self.post_norm = (
@@ -104,6 +111,7 @@ class SpatioTemporalTrans(nn.Module):
             trans_order='ts',
             space_post_norm=False,
             space_dropout_rate=0.,
+            interleaved=False,
     ):
         super(SpatioTemporalTrans, self).__init__()
 
@@ -113,6 +121,54 @@ class SpatioTemporalTrans(nn.Module):
                 "trans_order must be either 'ts' or 'st', "
                 f"but got {trans_order}"
             )
+
+        self.interleaved = bool(interleaved)
+        if self.interleaved:
+            self.space_regular = SpatioTransformer(
+                embedding_dim=embedding_dim,
+                num_layers=1,
+                num_heads=num_heads,
+                hidden_dim=hidden_dim,
+                window_size=space_window_size,
+                attn_drop=attn_dropout_rate,
+                input_drop=space_dropout_rate,
+                post_norm=False,
+                shift_size=0,
+            )
+            self.time_first = TemporalTransformer(
+                seq_length=seq_length,
+                embedding_dim=embedding_dim,
+                num_layers=1,
+                num_heads=num_heads,
+                hidden_dim=hidden_dim,
+                input_dropout_rate=input_dropout_rate,
+                attn_dropout_rate=attn_dropout_rate,
+                add_position=True,
+                final_norm=False,
+            )
+            self.space_shifted = SpatioTransformer(
+                embedding_dim=embedding_dim,
+                num_layers=1,
+                num_heads=num_heads,
+                hidden_dim=hidden_dim,
+                window_size=space_window_size,
+                attn_drop=attn_dropout_rate,
+                input_drop=space_dropout_rate,
+                post_norm=space_post_norm,
+                shift_size=space_window_size // 2,
+            )
+            self.time_second = TemporalTransformer(
+                seq_length=seq_length,
+                embedding_dim=embedding_dim,
+                num_layers=1,
+                num_heads=num_heads,
+                hidden_dim=hidden_dim,
+                input_dropout_rate=input_dropout_rate,
+                attn_dropout_rate=attn_dropout_rate,
+                add_position=False,
+                final_norm=True,
+            )
+            return
 
         self.timeTrans = TemporalTransformer(
             seq_length=seq_length,
@@ -135,6 +191,11 @@ class SpatioTemporalTrans(nn.Module):
         )
 
     def forward(self, x):
+        if self.interleaved:
+            x = self.space_regular(x)
+            x = self.time_first(x)
+            x = self.space_shifted(x)
+            return self.time_second(x)
         if self.trans_order == 'ts':
             x = self.timeTrans(x)
             x = self.spaceTrans(x)

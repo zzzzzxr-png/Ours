@@ -89,7 +89,8 @@ class MainFrame(nn.Module):
             in_channel,
             f_maps=[16, 32, 64],
             input_dropout_rate=0.1,
-            num_layers=0
+            num_layers=0,
+            skip_fusion='add',
     ):
         super(MainFrame, self).__init__()
         self.img_dim = img_dim
@@ -103,7 +104,8 @@ class MainFrame(nn.Module):
 
         # up + 2Conv
         self.decoders = self.temporalExcitation(
-            f_maps=f_maps[::-1] + [in_channel]
+            f_maps=f_maps[::-1] + [in_channel],
+            skip_fusion=skip_fusion,
         )
 
     def temporalSqueeze(self, f_maps, num_layers=0):
@@ -117,13 +119,14 @@ class MainFrame(nn.Module):
             model_list.append(encoder_layer)
         return model_list
 
-    def temporalExcitation(self, f_maps):
+    def temporalExcitation(self, f_maps, skip_fusion='add'):
         model_list = nn.ModuleList([])
         for idx in range(1, len(f_maps)):
             decoder_layer = ExcitationLayer(
                 in_channels=f_maps[idx-1],
                 out_channels=f_maps[idx],
-                if_up_sample=True
+                if_up_sample=True,
+                skip_fusion=skip_fusion,
             )
             model_list.append(decoder_layer)
         return model_list
@@ -178,6 +181,16 @@ class SqueezeLayer(nn.Module):
         return before_down, x
 
 
+def _identity_complex_conv(conv):
+    with torch.no_grad():
+        conv.weight.zero_()
+        channels = min(conv.in_channels, conv.out_channels)
+        for index in range(channels):
+            conv.weight[index, index, 0, 0, 0] = 1 + 0j
+        if conv.bias is not None:
+            conv.bias.zero_()
+
+
 class ExcitationLayer(nn.Module):
     def __init__(
             self,
@@ -185,6 +198,7 @@ class ExcitationLayer(nn.Module):
             out_channels,
             if_up_sample=True,
             kernel_size=3,
+            skip_fusion='add',
     ):
         super(ExcitationLayer, self).__init__()
         self.conv_net = DoubleConv(
@@ -194,14 +208,31 @@ class ExcitationLayer(nn.Module):
             if_encoder=False
         )
         self.if_up_sample = if_up_sample
+        if skip_fusion not in ('add', 'gated_add', 'conv_add'):
+            raise ValueError('unknown skip_fusion: {!r}'.format(skip_fusion))
+        self.skip_fusion = skip_fusion
+        if skip_fusion == 'gated_add':
+            self.skip_gate = nn.Parameter(
+                torch.ones(in_channels, dtype=torch.cfloat)
+            )
+        elif skip_fusion == 'conv_add':
+            self.skip_projection = cvnn.Conv3d(
+                in_channels, in_channels, kernel_size=1, padding=0
+            )
+            _identity_complex_conv(self.skip_projection.conv)
         self.up_sample = cvnn.ConvTranspose3d(in_channels=in_channels, out_channels=in_channels, kernel_size=(4,3,3), stride=(2,1,1), padding=(1,1,1))
         self.up_norm = ComplexRMSNorm3d()
 
     def forward(self, x, encoder_features):
         if self.if_up_sample:
             x = self.up_norm(self.up_sample(x))
-        x = (x + encoder_features) * (2 ** -0.5)
-        # x = torch.cat((encoder_features, x), dim=2)
+        if self.skip_fusion == 'gated_add':
+            skip = self.skip_gate.view(1, -1, 1, 1, 1) * encoder_features
+        elif self.skip_fusion == 'conv_add':
+            skip = self.skip_projection(encoder_features)
+        else:
+            skip = encoder_features
+        x = (x + skip) * (2 ** -0.5)
         x = self.conv_net(x)
         return x
 

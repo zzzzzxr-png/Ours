@@ -25,13 +25,16 @@ class SRDTrans_v2(MainFrame):
             space_post_norm=False,
             space_dropout_rate=0.,
             use_msconv_before_trans=False,
+            skip_fusion='add',
+            interleaved_transformer=False,
     ):
         super(SRDTrans_v2, self).__init__(
             img_dim,
             img_time,
             in_channel,
             f_maps=f_maps,
-            input_dropout_rate=input_dropout_rate
+            input_dropout_rate=input_dropout_rate,
+            skip_fusion=skip_fusion,
         )
 
         self.img_time = img_time
@@ -74,6 +77,7 @@ class SRDTrans_v2(MainFrame):
                     trans_order=trans_order,
                     space_post_norm=space_post_norm,
                     space_dropout_rate=space_dropout_rate,
+                    interleaved=interleaved_transformer,
                 )
             )
 

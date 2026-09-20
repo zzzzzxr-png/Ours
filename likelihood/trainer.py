@@ -269,7 +269,7 @@ class training_class_srdtrans:
         self.fmap = 16
         self.output_dir = './results'
         self.pth_dir = './experiments_srdtrans_protocol'
-        self.batch_size = 1
+        self.batch_size = None
         self.patch_t = 128
         self.patch_x = 128
         self.patch_y = 128
@@ -308,6 +308,8 @@ class training_class_srdtrans:
         self.attn_dropout_rate = 0.1
         self.input_dropout_rate = 0.0
         self.srdtrans_f_maps = [8, 16, 32, 64]
+        self.skip_fusion = 'add'
+        self.interleaved_transformer = False
         self.temporal_strides = None
         self.last_squeeze_op = 'conv'
         self.freq_aware = False
@@ -360,7 +362,12 @@ class training_class_srdtrans:
         # the fixed protocol window [snr_margin : val_process_frames - snr_margin].
         self.val_infer_frames = max(int(self.val_process_frames), int(self.patch_t))
         self.ngpu = str(self.GPU).count(',') + 1
-        self.batch_size = self.ngpu
+        if self.batch_size is None:
+            self.batch_size = self.ngpu
+        elif int(self.batch_size) < 1:
+            raise ValueError('batch_size must be positive, got {}'.format(self.batch_size))
+        else:
+            self.batch_size = int(self.batch_size)
         print('\033[1;31mSRDTrans protocol training parameters -----> \033[0m')
         print(self.__dict__)
 
@@ -495,6 +502,7 @@ class training_class_srdtrans:
             'dtcwt_channel_scales',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate',             'srdtrans_f_maps', 'input_dropout_rate',
+            'skip_fusion', 'interleaved_transformer',
             'temporal_strides', 'last_squeeze_op', 'freq_aware', 'ftvsr_enc1', 'enc_d2', 'upsample_mode', 'init_ckpt',
             'sampling_mode',
             'mask_ratio', 'mask_min_dist', 'lattice_random_phase',
