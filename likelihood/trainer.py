@@ -26,7 +26,7 @@ import torch.nn as nn
 import yaml
 from skimage import io
 from torch.utils.data import DataLoader
-from representation import DTCWT2D
+from representation import DTCWT2D, FourierPyramid2D
 
 from .dataset import (
     multibatch_test_save_srdtrans,
@@ -40,6 +40,7 @@ from .dataset import (
 from .backbone_factory import (
     DEFAULT_SRDTRANS_ROOT,
     DTCWTComplexBackbone,
+    FourierComplexBackbone,
     build_denoise_network_srdtrans,
 )
 from .sampling import generate_mask_pair, generate_subimages
@@ -97,6 +98,45 @@ def _estimate_fixed_dtcwt_scales(stacks, levels, chunk_frames=32):
         raise RuntimeError('failed to estimate finite positive DTCWT scales')
     torch.set_num_threads(previous_threads)
     return scales
+
+
+def _estimate_fixed_fourier_channel_scales(stacks, image_size, chunk_frames=32):
+    """One fixed RMS per Fourier coefficient channel from centered stacks."""
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(min(4, previous_threads))
+    transform = FourierPyramid2D(image_size=int(image_size), height=3, order=5)
+    square_sums = [0.0] * 20
+    counts = [0] * 20
+    try:
+        with torch.no_grad():
+            for stack in stacks:
+                top = (stack.shape[-2] - image_size) // 2
+                left = (stack.shape[-1] - image_size) // 2
+                for start in range(0, stack.shape[0], chunk_frames):
+                    block = np.ascontiguousarray(
+                        stack[start:start + chunk_frames,
+                              top:top + image_size, left:left + image_size]
+                    )
+                    value = torch.from_numpy(block)[None, None]
+                    coefficients = transform(value)
+                    branches = (
+                        coefficients.highpass,
+                        *coefficients.bands,
+                        coefficients.lowpass,
+                    )
+                    offset = 0
+                    for branch in branches:
+                        for channel in range(branch.shape[1]):
+                            item = branch[:, channel]
+                            square_sums[offset] += float(item.abs().square().sum())
+                            counts[offset] += item.numel()
+                            offset += 1
+        scales = [math.sqrt(total / count) for total, count in zip(square_sums, counts)]
+        if not all(math.isfinite(scale) and scale > 0 for scale in scales):
+            raise RuntimeError('failed to estimate finite positive Fourier channel scales')
+        return scales
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 def _adaptive_clip_grad_(parameters, warmup_norms, threshold, warmup_iters,
@@ -168,8 +208,8 @@ class _TrainingDiagnostics:
         self._save_activation('encoders.{}.down'.format(index), output[1])
 
     def _register_hooks(self):
-        if not isinstance(self.model, DTCWTComplexBackbone):
-            raise TypeError('training diagnostics require DTCWTComplexBackbone')
+        if not isinstance(self.model, (DTCWTComplexBackbone, FourierComplexBackbone)):
+            raise TypeError('training diagnostics require a complex representation backbone')
         core = self.model.backbone
         self.handles.append(core.register_forward_pre_hook(
             lambda _, inputs: self._save_activation('dtcwt_input', inputs[0])))
@@ -290,6 +330,8 @@ class training_class_srdtrans:
         self.dtcwt_levels = 3
         self.dtcwt_channel_normalize = False
         self.dtcwt_channel_scales = None
+        self.fourier_channel_normalize = True
+        self.fourier_channel_scales = None
         self.sampling_mode = 'spatial'
         # Full-resolution directional masked self-supervision.
         # spatial_mask / temporal_mask keep input shape [B, C, T, H, W] unchanged
@@ -499,7 +541,7 @@ class training_class_srdtrans:
             'train_datasets_size', 'overlap_factor', 'val_overlap_factor',
             'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'backbone',
             'representation', 'dtcwt_dim', 'dtcwt_levels', 'dtcwt_channel_normalize',
-            'dtcwt_channel_scales',
+            'dtcwt_channel_scales', 'fourier_channel_normalize', 'fourier_channel_scales',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate',             'srdtrans_f_maps', 'input_dropout_rate',
             'skip_fusion', 'interleaved_transformer',
@@ -1063,6 +1105,22 @@ class training_class_srdtrans:
             print('Fixed global DTCWT scales -----> {}'.format(
                 ', '.join('{:.6f}'.format(value)
                           for value in self.dtcwt_channel_scales)
+            ))
+        if self.representation == 'steerable_fourier' and self.fourier_channel_normalize:
+            image_size = min(
+                int(self.patch_x),
+                min(int(stack.shape[-2]) for stack in self.train_noise_img),
+                min(int(stack.shape[-1]) for stack in self.train_noise_img),
+            )
+            image_size = image_size // 16 * 16
+            if image_size < 16:
+                raise ValueError('Fourier normalization requires spatial size >= 16')
+            self.fourier_channel_scales = _estimate_fixed_fourier_channel_scales(
+                self.train_noise_img, image_size
+            )
+            print('Fixed Fourier channel scales -----> {}'.format(
+                ', '.join('{:.6f}'.format(value)
+                          for value in self.fourier_channel_scales)
             ))
         self.save_yaml_train()
         self.initialize_network()

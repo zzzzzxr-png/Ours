@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 
 from prior.deepcadrt import Network_3D_Unet
-from representation import DTCWT2D, LearnedDTCWTScaleAdapter
+from representation import (
+    DTCWT2D,
+    FourierPyramid2D,
+    LearnedDTCWTScaleAdapter,
+    LearnedFourierPyramidAdapter,
+)
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DEFAULT_SRDTRANS_ROOT = os.path.join(_PROJECT_ROOT, 'prior', 'srdtrans', 'SRDTrans_v2')
@@ -105,6 +110,66 @@ class DTCWTComplexBackbone(nn.Module):
         return self.representation.inverse(predicted)
 
 
+class FourierComplexBackbone(nn.Module):
+    """Real video -> complex steerable Fourier pyramid -> complex SRDTrans."""
+
+    def __init__(self, backbone: nn.Module, image_size, image_channels=1,
+                 channel_normalize=True, channel_scales=None):
+        super().__init__()
+        self.backbone = backbone
+        self.representation = FourierPyramid2D(
+            image_size=image_size, height=3, order=5,
+            image_channels=image_channels,
+        )
+        self.adapter = LearnedFourierPyramidAdapter(
+            image_channels=image_channels, height=3, orientations=6,
+        )
+        self.channel_normalize = bool(channel_normalize)
+        if self.channel_normalize:
+            if channel_scales is None or len(channel_scales) != 20:
+                raise ValueError('Fourier normalization needs 20 coefficient scales')
+            scales = torch.as_tensor(channel_scales, dtype=torch.float32)
+            if not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
+                raise ValueError('Fourier channel scales must be finite and positive')
+        else:
+            scales = torch.ones(20, dtype=torch.float32)
+        self.register_buffer('channel_scales', scales)
+
+    def _scale_branches(self, coefficients, inverse=False):
+        branches = (coefficients.highpass,) + coefficients.bands + (coefficients.lowpass,)
+        scaled = []
+        offset = 0
+        for value in branches:
+            channels = value.shape[1]
+            scale = self.channel_scales[offset:offset + channels].to(value.dtype)
+            scale = scale.reshape(1, channels, 1, 1, 1)
+            scaled.append(value * scale if inverse else value / scale)
+            offset += channels
+        return type(coefficients)(
+            scaled[0], tuple(scaled[1:-1]), scaled[-1],
+            coefficients.spatial_size, coefficients.image_channels,
+        )
+
+    def forward(self, x):
+        if x.ndim != 5 or x.shape[1] != 1 or x.is_complex():
+            raise ValueError(
+                'expected real [B,1,T,H,W], got shape={} dtype={}'.format(
+                    tuple(x.shape), x.dtype
+                )
+            )
+        coefficients = self.representation(x)
+        if self.channel_normalize:
+            coefficients = self._scale_branches(coefficients)
+        features = self.adapter.encode(coefficients)
+        predicted = self.backbone(features)
+        if predicted.shape != features.shape or not predicted.is_complex():
+            raise RuntimeError('complex SRDTrans changed aligned Fourier feature shape')
+        predicted = self.adapter.decode(predicted, coefficients)
+        if self.channel_normalize:
+            predicted = self._scale_branches(predicted, inverse=True)
+        return self.representation.inverse(predicted)
+
+
 def ensure_srdtrans_repo_on_path(srdtrans_root=None):
     root = os.path.abspath(srdtrans_root or DEFAULT_SRDTRANS_ROOT)
     if not os.path.isdir(root):
@@ -172,7 +237,7 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     use_msconv_before_trans = bool(getattr(cfg, 'use_msconv_before_trans', False))
     levels = int(getattr(cfg, 'dtcwt_levels', 3))
     coefficient_dim = int(cfg.patch_x) // 2
-    coefficient_channels = 2 + 6 * levels
+    coefficient_channels = 23 if getattr(cfg, 'representation', 'dtcwt') == 'steerable_fourier' else 2 + 6 * levels
     f_maps[0] = max(coefficient_channels, f_maps[0])
     for index in range(1, len(f_maps)):
         f_maps[index] = max(f_maps[index - 1], f_maps[index])
@@ -241,23 +306,33 @@ def build_denoise_network_srdtrans(cfg):
         SRDTrans_v2 = import_srdtrans_v2_class(getattr(cfg, 'srdtrans_root', None))
         representation = getattr(cfg, 'representation', 'dtcwt')
         dtcwt_dim = int(getattr(cfg, 'dtcwt_dim', 2))
-        if representation != 'dtcwt':
-            raise ValueError('SRDTrans_v2 representation must be dtcwt, got {!r}'.format(
+        if representation not in ('dtcwt', 'steerable_fourier'):
+            raise ValueError('unknown SRDTrans_v2 representation {!r}'.format(
                 representation))
         # ponytail: 2D only; add a published differentiable 3D backend when requested.
         if dtcwt_dim != 2:
             raise NotImplementedError('Only --dtcwt_dim 2 is implemented')
         levels = int(getattr(cfg, 'dtcwt_levels', 3))
-        model = DTCWTComplexBackbone(
-            _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2),
-            levels=levels,
-            channel_normalize=bool(
-                getattr(cfg, 'dtcwt_channel_normalize', False)
-            ),
-            channel_scales=getattr(cfg, 'dtcwt_channel_scales', None),
-            biort=getattr(cfg, 'dtcwt_biort', 'near_sym_b'),
-            qshift=getattr(cfg, 'dtcwt_qshift', 'qshift_b'),
-        )
+        backbone_model = _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2)
+        if representation == 'dtcwt':
+            model = DTCWTComplexBackbone(
+                backbone_model,
+                levels=levels,
+                channel_normalize=bool(
+                    getattr(cfg, 'dtcwt_channel_normalize', False)
+                ),
+                channel_scales=getattr(cfg, 'dtcwt_channel_scales', None),
+                biort=getattr(cfg, 'dtcwt_biort', 'near_sym_b'),
+                qshift=getattr(cfg, 'dtcwt_qshift', 'qshift_b'),
+            )
+        else:
+            if levels != 3:
+                raise ValueError('steerable_fourier currently requires --dtcwt_levels 3')
+            model = FourierComplexBackbone(
+                backbone_model, image_size=int(cfg.patch_x), image_channels=1,
+                channel_normalize=bool(getattr(cfg, 'fourier_channel_normalize', True)),
+                channel_scales=getattr(cfg, 'fourier_channel_scales', None),
+            )
     else:
         raise ValueError(
             'SRDTrans protocol supports backbone unet or srdtrans_v2, '

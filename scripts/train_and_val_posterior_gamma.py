@@ -89,11 +89,15 @@ def parse_args():
                         ],
                         help='Denoise backbone (all external backbones use 1ch, '
                              'trained from scratch under SRD protocol)')
-    parser.add_argument('--representation', type=str, default='dtcwt', choices=['dtcwt'])
+    parser.add_argument('--representation', type=str, default='dtcwt',
+                        choices=['dtcwt', 'steerable_fourier'])
     parser.add_argument('--dtcwt_dim', type=int, default=2, choices=[2, 3])
     parser.add_argument('--dtcwt_levels', type=int, default=3)
     parser.add_argument('--dtcwt-channel-normalize', action='store_true',
                         help='Normalize each aligned complex DTCWT channel by its RMS.')
+    parser.add_argument('--fourier-channel-normalize',
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help='Normalize each steerable Fourier channel by its fixed RMS.')
     parser.add_argument('--adaptive-grad-clip', action='store_true',
                         help='Calibrate a fixed global gradient-norm clip from warmup.')
     parser.add_argument('--grad-clip-warmup-iters', type=int, default=1000)
@@ -315,6 +319,7 @@ def main():
         'dtcwt_dim': args.dtcwt_dim,
         'dtcwt_levels': args.dtcwt_levels,
         'dtcwt_channel_normalize': args.dtcwt_channel_normalize,
+        'fourier_channel_normalize': args.fourier_channel_normalize,
         'adaptive_grad_clip': args.adaptive_grad_clip,
         'grad_clip_warmup_iters': args.grad_clip_warmup_iters,
         'grad_clip_percentile': args.grad_clip_percentile,
