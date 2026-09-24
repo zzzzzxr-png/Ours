@@ -1,10 +1,47 @@
 """Learned branch alignment for the plenoptic Fourier pyramid."""
 
 import torch
-import torch.nn.functional as F
+import complextorch.nn as cvnn
 
 from .fourier_pyramid import FourierPyramidCoefficients
 from .dtcwt_adapter import _learned_head
+
+
+class LegacyFourierPyramidAdapter(torch.nn.Module):
+    """Original learned 20-channel alignment used by the patch-64 experiment."""
+
+    branch_channels = [1, 6, 6, 6, 1]
+
+    @property
+    def feature_channels(self):
+        return sum(self.branch_channels)
+
+    def __init__(self):
+        super().__init__()
+        factors = [1, 1, 2, 4, 8]
+        self.analysis_heads = torch.nn.ModuleList([
+            _learned_head(channels, factor, up=True)
+            for channels, factor in zip(self.branch_channels, factors)
+        ])
+        self.synthesis_heads = torch.nn.ModuleList([
+            _learned_head(channels, factor, up=False)
+            for channels, factor in zip(self.branch_channels, factors)
+        ])
+
+    def encode(self, coefficients):
+        branches = (coefficients.highpass,) + coefficients.bands + (coefficients.lowpass,)
+        aligned = tuple(head(value) for head, value in zip(self.analysis_heads, branches))
+        return torch.cat(aligned, dim=1)
+
+    def decode(self, features, reference):
+        if features.shape[1] != self.feature_channels:
+            raise ValueError('expected legacy Fourier features with C=20')
+        branches = torch.split(features, self.branch_channels, dim=1)
+        decoded = tuple(head(value) for head, value in zip(self.synthesis_heads, branches))
+        return FourierPyramidCoefficients(
+            decoded[0], tuple(decoded[1:-1]), decoded[-1],
+            reference.spatial_size, reference.image_channels,
+        )
 
 
 class LearnedFourierPyramidAdapter(torch.nn.Module):
@@ -14,21 +51,30 @@ class LearnedFourierPyramidAdapter(torch.nn.Module):
         super().__init__()
         if int(image_channels) != 1 or int(height) != 3 or int(orientations) != 6:
             raise ValueError('current SRDTrans Fourier adapter expects 1x3x6 branches')
-        # Keep all branches on the H/2 grid. The full-resolution highpass is
-        # rearranged losslessly into four polyphase channels first.
-        self.branch_channels = [4] + [orientations] * height + [1]
+        # Learned overlapping spatial reduction; not an invertible transform.
+        self.branch_channels = [3, 20, orientations, 2, 1]
         self.analysis_heads = torch.nn.ModuleList([
-            _learned_head(4, 1, up=True),       # highpass H -> 4 x H/2
-            _learned_head(orientations, 2, up=False),  # scale 0 H -> H/2
+            cvnn.Conv3d(1, 3, (1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
+            cvnn.Conv3d(orientations, 20, (1, 3, 3),
+                        stride=(1, 2, 2), padding=(0, 1, 1)),
             _learned_head(orientations, 1, up=True),  # scale 1 H/2
-            _learned_head(orientations, 2, up=True),  # scale 2 H/4 -> H/2
+            torch.nn.Sequential(
+                _learned_head(orientations, 2, up=True),
+                cvnn.Conv3d(orientations, 2, (1, 1, 1)),
+            ),  # scale 2 H/4 -> H/2, then 6 -> 2 channels
             _learned_head(1, 4, up=True),         # lowpass H/8 -> H/2
         ])
         self.synthesis_heads = torch.nn.ModuleList([
-            _learned_head(4, 1, up=True),
-            _learned_head(orientations, 2, up=True),
+            cvnn.ConvTranspose3d(3, 1, (1, 3, 3), stride=(1, 2, 2),
+                                 padding=(0, 1, 1), output_padding=(0, 1, 1)),
+            cvnn.ConvTranspose3d(20, orientations, (1, 3, 3),
+                                 stride=(1, 2, 2), padding=(0, 1, 1),
+                                 output_padding=(0, 1, 1)),
             _learned_head(orientations, 1, up=True),
-            _learned_head(orientations, 2, up=False),
+            torch.nn.Sequential(
+                cvnn.Conv3d(2, orientations, (1, 1, 1)),
+                _learned_head(orientations, 2, up=False),
+            ),
             _learned_head(1, 4, up=False),
         ])
 
@@ -41,9 +87,6 @@ class LearnedFourierPyramidAdapter(torch.nn.Module):
         batch, channels, time, height, width = highpass.shape
         if channels != 1 or height % 2 or width % 2:
             raise ValueError('highpass must be [B,1,T,even H,even W]')
-        highpass = F.pixel_unshuffle(
-            highpass.permute(0, 2, 1, 3, 4).reshape(batch * time, channels, height, width), 2
-        ).reshape(batch, time, 4 * channels, height // 2, width // 2).permute(0, 2, 1, 3, 4)
         branches = (highpass,) + coefficients.bands + (coefficients.lowpass,)
         aligned = tuple(head(value) for head, value in zip(self.analysis_heads, branches))
         target_size = aligned[0].shape[-2:]
@@ -58,12 +101,9 @@ class LearnedFourierPyramidAdapter(torch.nn.Module):
             ))
         branches = torch.split(features, self.branch_channels, dim=1)
         decoded = list(head(value) for head, value in zip(self.synthesis_heads, branches))
-        highpass = decoded[0]
-        batch, channels, time, height, width = highpass.shape
-        highpass = F.pixel_shuffle(
-            highpass.permute(0, 2, 1, 3, 4).reshape(batch * time, channels, height, width), 2
-        ).reshape(batch, time, channels // 4, height * 2, width * 2).permute(0, 2, 1, 3, 4)
-        decoded[0] = highpass
+        targets = (reference.highpass,) + reference.bands + (reference.lowpass,)
+        if any(value.shape != target.shape for value, target in zip(decoded, targets)):
+            raise ValueError('Fourier decoded coefficient shapes do not match reference')
         return FourierPyramidCoefficients(
             highpass=decoded[0],
             bands=tuple(decoded[1:-1]),

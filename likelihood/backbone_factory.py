@@ -12,7 +12,7 @@ from representation import (
     DTCWT2D,
     FourierPyramid2D,
     LearnedDTCWTScaleAdapter,
-    LearnedFourierPyramidAdapter,
+    LearnedFourierPyramidAdapter, LegacyFourierPyramidAdapter,
 )
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -114,16 +114,17 @@ class FourierComplexBackbone(nn.Module):
     """Real video -> complex steerable Fourier pyramid -> complex SRDTrans."""
 
     def __init__(self, backbone: nn.Module, image_size, image_channels=1,
-                 channel_normalize=True, channel_scales=None):
+                 channel_normalize=True, channel_scales=None, legacy_adapter=False):
         super().__init__()
         self.backbone = backbone
         self.representation = FourierPyramid2D(
             image_size=image_size, height=3, order=5,
             image_channels=image_channels,
         )
-        self.adapter = LearnedFourierPyramidAdapter(
-            image_channels=image_channels, height=3, orientations=6,
-        )
+        self.adapter = (LegacyFourierPyramidAdapter() if legacy_adapter else
+                        LearnedFourierPyramidAdapter(
+                            image_channels=image_channels, height=3, orientations=6,
+                        ))
         self.channel_normalize = bool(channel_normalize)
         if self.channel_normalize:
             if channel_scales is None or len(channel_scales) != 20:
@@ -236,8 +237,12 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     space_dropout_rate = float(getattr(cfg, 'space_dropout_rate', 0.0))
     use_msconv_before_trans = bool(getattr(cfg, 'use_msconv_before_trans', False))
     levels = int(getattr(cfg, 'dtcwt_levels', 3))
-    coefficient_dim = int(cfg.patch_x) // 2
-    coefficient_channels = 23 if getattr(cfg, 'representation', 'dtcwt') == 'steerable_fourier' else 2 + 6 * levels
+    legacy_fourier = (getattr(cfg, 'representation', 'dtcwt') == 'steerable_fourier'
+                      and bool(getattr(cfg, 'legacy_fourier_adapter', False)))
+    coefficient_dim = int(cfg.patch_x) if legacy_fourier else int(cfg.patch_x) // 2
+    coefficient_channels = (20 if legacy_fourier else
+                            (32 if getattr(cfg, 'representation', 'dtcwt') == 'steerable_fourier'
+                             else 2 + 6 * levels))
     f_maps[0] = max(coefficient_channels, f_maps[0])
     for index in range(1, len(f_maps)):
         f_maps[index] = max(f_maps[index - 1], f_maps[index])
@@ -263,6 +268,9 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     )
     model.gradient_checkpointing = bool(
         getattr(cfg, 'gradient_checkpointing', True)
+    )
+    model.checkpoint_transformer_only = bool(
+        getattr(cfg, 'checkpoint_transformer_only', False)
     )
     param_num = sum(p.numel() for p in model.parameters())
     print(
@@ -313,6 +321,8 @@ def build_denoise_network_srdtrans(cfg):
         if dtcwt_dim != 2:
             raise NotImplementedError('Only --dtcwt_dim 2 is implemented')
         levels = int(getattr(cfg, 'dtcwt_levels', 3))
+        legacy_fourier = (representation == 'steerable_fourier'
+                          and bool(getattr(cfg, 'legacy_fourier_adapter', False)))
         backbone_model = _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2)
         if representation == 'dtcwt':
             model = DTCWTComplexBackbone(
@@ -332,6 +342,7 @@ def build_denoise_network_srdtrans(cfg):
                 backbone_model, image_size=int(cfg.patch_x), image_channels=1,
                 channel_normalize=bool(getattr(cfg, 'fourier_channel_normalize', True)),
                 channel_scales=getattr(cfg, 'fourier_channel_scales', None),
+                legacy_adapter=legacy_fourier,
             )
     else:
         raise ValueError(

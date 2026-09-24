@@ -26,6 +26,8 @@ import torch.nn as nn
 import yaml
 from skimage import io
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel
 from representation import DTCWT2D, FourierPyramid2D
 
 from .dataset import (
@@ -186,7 +188,9 @@ class _TrainingDiagnostics:
     """Sparse stage activations and per-stage optimizer-update diagnostics."""
 
     def __init__(self, model, path, interval):
-        self.model = model.module if isinstance(model, nn.DataParallel) else model
+        self.model = model.module if isinstance(
+            model, (nn.DataParallel, DistributedDataParallel)
+        ) else model
         self.path = path
         self.interval = int(interval)
         self.enabled = False
@@ -301,6 +305,10 @@ class training_class_srdtrans:
     """SRDTrans-protocol trainer with optional GT SNR validation."""
 
     def __init__(self, params_dict):
+        self.distributed = bool(int(os.environ.get('WORLD_SIZE', '1')) > 1)
+        self.rank = int(os.environ.get('RANK', '0'))
+        self.local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        self.world_size = int(os.environ.get('WORLD_SIZE', '1'))
         self.overlap_factor = 0.5
         self.val_overlap_factor = 0.5
         self.datasets_path = ''
@@ -331,6 +339,7 @@ class training_class_srdtrans:
         self.dtcwt_channel_normalize = False
         self.dtcwt_channel_scales = None
         self.fourier_channel_normalize = True
+        self.legacy_fourier_adapter = False
         self.fourier_channel_scales = None
         self.sampling_mode = 'spatial'
         # Full-resolution directional masked self-supervision.
@@ -403,15 +412,20 @@ class training_class_srdtrans:
         # Inference may need >= patch_t frames for tiling, but SNR always uses
         # the fixed protocol window [snr_margin : val_process_frames - snr_margin].
         self.val_infer_frames = max(int(self.val_process_frames), int(self.patch_t))
-        self.ngpu = str(self.GPU).count(',') + 1
+        if self.distributed:
+            self.ngpu = self.world_size
+            self.GPU = str(self.local_rank)
+        else:
+            self.ngpu = str(self.GPU).count(',') + 1
         if self.batch_size is None:
             self.batch_size = self.ngpu
         elif int(self.batch_size) < 1:
             raise ValueError('batch_size must be positive, got {}'.format(self.batch_size))
         else:
             self.batch_size = int(self.batch_size)
-        print('\033[1;31mSRDTrans protocol training parameters -----> \033[0m')
-        print(self.__dict__)
+        if not self.distributed or self.rank == 0:
+            print('\033[1;31mSRDTrans protocol training parameters -----> \033[0m')
+            print(self.__dict__)
 
     def prepare_file(self):
         parts = self.datasets_path.rstrip('/').split('/')
@@ -471,10 +485,10 @@ class training_class_srdtrans:
             model_state = state.get('model_state_dict')
             optimizer_state = state.get('optimizer_state_dict')
             if model_state is not None and optimizer_state is not None:
-                if isinstance(self.local_model, nn.DataParallel):
-                    self.local_model.module.load_state_dict(model_state)
-                else:
-                    self.local_model.load_state_dict(model_state)
+                target = self.local_model.module if isinstance(
+                    self.local_model, (nn.DataParallel, DistributedDataParallel)
+                ) else self.local_model
+                target.load_state_dict(model_state)
                 self._resume_optimizer_state = optimizer_state
                 self._resume_start_epoch = int(state['next_epoch'])
                 self._resume_global_iter = int(state.get('global_iter', 0))
@@ -493,10 +507,10 @@ class training_class_srdtrans:
 
         ckpt_path, epoch_1idx, iter_1idx = found
         state = torch.load(ckpt_path, map_location='cpu')
-        if isinstance(self.local_model, nn.DataParallel):
-            self.local_model.module.load_state_dict(state)
-        else:
-            self.local_model.load_state_dict(state)
+        target = self.local_model.module if isinstance(
+            self.local_model, (nn.DataParallel, DistributedDataParallel)
+        ) else self.local_model
+        target.load_state_dict(state)
 
         # E_36 was saved at end of 0-based epoch 35 -> resume at epoch index 36.
         self._resume_start_epoch = epoch_1idx
@@ -541,6 +555,7 @@ class training_class_srdtrans:
             'train_datasets_size', 'overlap_factor', 'val_overlap_factor',
             'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'backbone',
             'representation', 'dtcwt_dim', 'dtcwt_levels', 'dtcwt_channel_normalize',
+            'legacy_fourier_adapter',
             'dtcwt_channel_scales', 'fourier_channel_normalize', 'fourier_channel_scales',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate',             'srdtrans_f_maps', 'input_dropout_rate',
@@ -593,9 +608,23 @@ class training_class_srdtrans:
     def distribute_GPU(self):
         _bind_visible_gpu(str(self.GPU))
         if torch.cuda.is_available():
-            self.local_model = self.local_model.cuda()
-            self.local_model = nn.DataParallel(self.local_model, device_ids=range(self.ngpu))
-            print('\033[1;31mUsing {} GPU(s) -----> \033[0m'.format(torch.cuda.device_count()))
+            if self.distributed:
+                if not torch.distributed.is_initialized():
+                    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+                torch.cuda.set_device(self.local_rank)
+                self.local_model = self.local_model.cuda(self.local_rank)
+                self.local_model = DistributedDataParallel(
+                    self.local_model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    broadcast_buffers=False,
+                )
+                if self.rank == 0:
+                    print('\033[1;31mUsing DDP on {} GPU(s) -----> \033[0m'.format(self.world_size))
+            else:
+                self.local_model = self.local_model.cuda()
+                self.local_model = nn.DataParallel(self.local_model, device_ids=range(self.ngpu))
+                print('\033[1;31mUsing {} GPU(s) -----> \033[0m'.format(torch.cuda.device_count()))
 
     def _prepare_eval_cache(self):
         if self._eval_cache_ready:
@@ -639,9 +668,13 @@ class training_class_srdtrans:
             self.local_model.parameters(), lr=self.lr, betas=(self.b1, self.b2))
         if getattr(self, '_resume_optimizer_state', None) is not None:
             optimizer_G.load_state_dict(self._resume_optimizer_state)
+            # Keep the requested run learning rate when resuming Adam state.
+            for group in optimizer_G.param_groups:
+                group['lr'] = float(self.lr)
             print('Resume Adam optimizer state -----> loaded')
         diagnostics = None
-        if int(getattr(self, 'diagnostic_interval', 0)) > 0:
+        if int(getattr(self, 'diagnostic_interval', 0)) > 0 and (
+                not self.distributed or self.rank == 0):
             diagnostics = _TrainingDiagnostics(
                 self.local_model,
                 os.path.join(self.pth_path, 'training_diagnostics.csv'),
@@ -695,10 +728,20 @@ class training_class_srdtrans:
                         if self.random_patch_coordinates else None
                     ),
                 )
+            sampler = DistributedSampler(
+                train_data,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True,
+                seed=int(self.seed or 0),
+            ) if self.distributed else None
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             trainloader = DataLoader(
                 train_data,
                 batch_size=self.batch_size,
-                shuffle=True,
+                shuffle=sampler is None,
+                sampler=sampler,
                 num_workers=self.num_workers,
                 generator=loader_generator,
                 worker_init_fn=worker_init_fn,
@@ -815,7 +858,7 @@ class training_class_srdtrans:
                     raise FloatingPointError(
                         'non-finite loss at global iteration {}'.format(global_iter + 1))
 
-                optimizer_G.zero_grad()
+                optimizer_G.zero_grad(set_to_none=True)
                 total_loss.backward()
                 if diagnostics:
                     try:
@@ -850,18 +893,19 @@ class training_class_srdtrans:
                             'median': float(np.median(warmup_grad_norms)),
                             'maximum': float(np.max(warmup_grad_norms)),
                         }
-                        with open(os.path.join(
-                                self.pth_path, 'grad_clip_calibration.yaml'), 'w') as f:
-                            yaml.safe_dump(calibration, f, sort_keys=False)
-                        print(
-                            '\nAdaptive gradient clip calibrated: '
-                            'P{:.1f}={:.6g}, median={:.6g}, max={:.6g}'.format(
-                                float(self.grad_clip_percentile),
-                                grad_clip_threshold,
-                                calibration['median'],
-                                calibration['maximum'],
+                        if not self.distributed or self.rank == 0:
+                            with open(os.path.join(
+                                    self.pth_path, 'grad_clip_calibration.yaml'), 'w') as f:
+                                yaml.safe_dump(calibration, f, sort_keys=False)
+                            print(
+                                '\nAdaptive gradient clip calibrated: '
+                                'P{:.1f}={:.6g}, median={:.6g}, max={:.6g}'.format(
+                                    float(self.grad_clip_percentile),
+                                    grad_clip_threshold,
+                                    calibration['median'],
+                                    calibration['maximum'],
+                                )
                             )
-                        )
                 optimizer_G.step()
                 global_iter += 1
                 if diagnostic_before is not None:
@@ -874,6 +918,8 @@ class training_class_srdtrans:
                     seconds=int(batches_left * (time.time() - prev_time)))
                 prev_time = time.time()
 
+                if self.distributed and self.rank != 0:
+                    continue
                 print(
                     '\r[Epoch %d/%d] [Batch %d/%d] [Total loss: %.2f] [ETA: %s] [Time cost: %.0d s] '
                     % (
@@ -904,14 +950,18 @@ class training_class_srdtrans:
                         self.test(epoch, iteration)
                         self.local_model.train()
                     print('\n', end=' ')
+            if self.distributed:
+                torch.distributed.barrier()
 
     def save_model(self, epoch, iteration, optimizer=None, global_iter=None):
+        if self.distributed and self.rank != 0:
+            return
         os.makedirs(self.pth_path, exist_ok=True)
         model_save_name = os.path.join(
             self.pth_path,
             'E_{}_Iter_{}.pth'.format(str(epoch + 1).zfill(2), str(iteration + 1).zfill(4)),
         )
-        if isinstance(self.local_model, nn.DataParallel):
+        if isinstance(self.local_model, (nn.DataParallel, DistributedDataParallel)):
             model_state = self.local_model.module.state_dict()
         else:
             model_state = self.local_model.state_dict()
@@ -1085,6 +1135,10 @@ class training_class_srdtrans:
 
     def run(self):
         _bind_visible_gpu(str(self.GPU))
+        if self.distributed:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.set_float32_matmul_precision('highest')
         if getattr(self, 'seed', None) is not None:
             set_random_seed(int(self.seed))
             print('Random seed fixed: {}'.format(self.seed))
@@ -1122,7 +1176,8 @@ class training_class_srdtrans:
                 ', '.join('{:.6f}'.format(value)
                           for value in self.fourier_channel_scales)
             ))
-        self.save_yaml_train()
+        if not self.distributed or self.rank == 0:
+            self.save_yaml_train()
         self.initialize_network()
         self.distribute_GPU()
         if getattr(self, 'init_ckpt', ''):

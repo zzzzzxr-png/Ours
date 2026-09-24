@@ -97,6 +97,7 @@ class MainFrame(nn.Module):
         self.img_time = img_time
         self.f_maps = f_maps
         self.gradient_checkpointing = True
+        self.checkpoint_transformer_only = False
         # 2Conv + Down
         self.encoders = self.temporalSqueeze(
             f_maps=[in_channel] + f_maps
@@ -137,7 +138,7 @@ class MainFrame(nn.Module):
     def forward(self, x):
         encoders_features = []
         for encoder in self.encoders:
-            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            if self.gradient_checkpointing and not self.checkpoint_transformer_only and self.training and torch.is_grad_enabled():
                 before_down, x = checkpoint(encoder, x, use_reentrant=False)
             else:
                 before_down, x = encoder(x)
@@ -150,7 +151,7 @@ class MainFrame(nn.Module):
             x = self.process_by_trans(x)
 
         for decoder, encoder_features in zip(self.decoders, encoders_features):
-            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            if self.gradient_checkpointing and not self.checkpoint_transformer_only and self.training and torch.is_grad_enabled():
                 x = checkpoint(decoder, x, encoder_features, use_reentrant=False)
             else:
                 x = decoder(x, encoder_features)

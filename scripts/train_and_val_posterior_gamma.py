@@ -98,6 +98,8 @@ def parse_args():
     parser.add_argument('--fourier-channel-normalize',
                         action=argparse.BooleanOptionalAction, default=True,
                         help='Normalize each steerable Fourier channel by its fixed RMS.')
+    parser.add_argument('--legacy-fourier-adapter', action='store_true',
+                        help='Use the original fixed 20-channel Fourier adapter.')
     parser.add_argument('--adaptive-grad-clip', action='store_true',
                         help='Calibrate a fixed global gradient-norm clip from warmup.')
     parser.add_argument('--grad-clip-warmup-iters', type=int, default=1000)
@@ -123,6 +125,8 @@ def parse_args():
                         help='Complex decoder skip fusion; add preserves the baseline.')
     parser.add_argument('--interleaved-transformer', action='store_true',
                         help='Use spatial-temporal-spatial-temporal transformer ordering.')
+    parser.add_argument('--checkpoint-transformer-only', action='store_true',
+                        help='Checkpoint only the Transformer stage.')
     parser.add_argument('--temporal_strides', type=str, default=None,
                         help='Comma-separated temporal strides for SRDTrans backbone '
                              '(e.g. 2,2,2,2); ignored for other backbones')
@@ -320,6 +324,7 @@ def main():
         'dtcwt_levels': args.dtcwt_levels,
         'dtcwt_channel_normalize': args.dtcwt_channel_normalize,
         'fourier_channel_normalize': args.fourier_channel_normalize,
+        'legacy_fourier_adapter': args.legacy_fourier_adapter,
         'adaptive_grad_clip': args.adaptive_grad_clip,
         'grad_clip_warmup_iters': args.grad_clip_warmup_iters,
         'grad_clip_percentile': args.grad_clip_percentile,
@@ -337,6 +342,7 @@ def main():
         'srdtrans_f_maps': srdtrans_f_maps,
         'skip_fusion': args.skip_fusion,
         'interleaved_transformer': args.interleaved_transformer,
+        'checkpoint_transformer_only': args.checkpoint_transformer_only,
         'temporal_strides': temporal_strides,
         'last_squeeze_op': args.last_squeeze_op,
         'GPU': args.gpu,
