@@ -559,7 +559,7 @@ class training_class_srdtrans:
             'dtcwt_channel_scales', 'fourier_channel_normalize', 'fourier_channel_scales',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate',             'srdtrans_f_maps', 'input_dropout_rate',
-            'skip_fusion', 'interleaved_transformer',
+            'skip_fusion', 'interleaved_transformer', 'space_attention',
             'temporal_strides', 'last_squeeze_op', 'freq_aware', 'ftvsr_enc1', 'enc_d2', 'upsample_mode', 'init_ckpt',
             'sampling_mode',
             'mask_ratio', 'mask_min_dist', 'lattice_random_phase',

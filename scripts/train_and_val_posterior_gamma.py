@@ -125,6 +125,9 @@ def parse_args():
                         help='Complex decoder skip fusion; add preserves the baseline.')
     parser.add_argument('--interleaved-transformer', action='store_true',
                         help='Use spatial-temporal-spatial-temporal transformer ordering.')
+    parser.add_argument('--space-attention', choices=['swin', 'restormer'],
+                        default='swin',
+                        help='Spatial attention backend; swin preserves the baseline.')
     parser.add_argument('--checkpoint-transformer-only', action='store_true',
                         help='Checkpoint only the Transformer stage.')
     parser.add_argument('--temporal_strides', type=str, default=None,

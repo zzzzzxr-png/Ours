@@ -265,6 +265,7 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
         use_msconv_before_trans=use_msconv_before_trans,
         skip_fusion=getattr(cfg, 'skip_fusion', 'add'),
         interleaved_transformer=bool(getattr(cfg, 'interleaved_transformer', False)),
+        space_attention=getattr(cfg, 'space_attention', 'swin'),
     )
     model.gradient_checkpointing = bool(
         getattr(cfg, 'gradient_checkpointing', True)
