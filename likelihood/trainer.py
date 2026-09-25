@@ -361,6 +361,7 @@ class training_class_srdtrans:
         self.srdtrans_f_maps = [8, 16, 32, 64]
         self.skip_fusion = 'add'
         self.interleaved_transformer = False
+        self.space_attention = 'swin'
         self.temporal_strides = None
         self.last_squeeze_op = 'conv'
         self.freq_aware = False
