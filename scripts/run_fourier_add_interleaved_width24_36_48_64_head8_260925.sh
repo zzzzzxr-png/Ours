@@ -4,7 +4,7 @@ set -euo pipefail
 cd /data/zhouxirou/Ours_260911
 data=/data/zhouxirou/All_Datasets/dataset_CI_syn_Q004_a5000_b1600/dataset_zxr_all_frequency_Q004_beta1600-1-T1000H245W245
 python=/home/zxr/.conda/envs/physics/bin/python
-root=experiments/260925_steerable_fourier_add_interleaved_width24_36_48_64_head8_hidden384_patch64_pure_l1l2_lr1e-4_v2
+root="${EXPERIMENT_ROOT:-experiments/260925_steerable_fourier_add_interleaved_width24_36_48_64_head8_hidden384_patch64_pure_l1l2_lr1e-4_v2}"
 
 if [[ -e "$root" ]]; then
     echo "refusing to overwrite existing experiment: $root" >&2
