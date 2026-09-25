@@ -39,6 +39,6 @@ run_one() {
     echo "launched freq=${freq}Hz cuda=${gpu} pid=$!"
 }
 
-run_one 0 0.1
-run_one 1 30
+run_one "${GPU_A:-0}" 0.1
+run_one "${GPU_B:-1}" 30
 wait
