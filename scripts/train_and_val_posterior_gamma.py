@@ -345,6 +345,7 @@ def main():
         'srdtrans_f_maps': srdtrans_f_maps,
         'skip_fusion': args.skip_fusion,
         'interleaved_transformer': args.interleaved_transformer,
+        'space_attention': args.space_attention,
         'checkpoint_transformer_only': args.checkpoint_transformer_only,
         'temporal_strides': temporal_strides,
         'last_squeeze_op': args.last_squeeze_op,
