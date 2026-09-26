@@ -34,6 +34,7 @@ run_one() {
         --attn-dropout-rate 0.1 --input-dropout-rate 0 --trans_order st \
         --mask_loss l1l2 --num_workers 4 --val_process_frames 400 \
         --skip-fusion add --interleaved-transformer \
+        --space-attention "${SPACE_ATTENTION:-swin}" \
         --no-gradient-checkpointing --seed 1024 \
         2>&1 | tee -a "$run_dir/train.log" &
     echo "launched freq=${freq}Hz cuda=${gpu} pid=$!"
