@@ -2,10 +2,15 @@
 
 import torch
 import os
+from einops import rearrange
 
 from likelihood.backbone_factory import build_denoise_network_srdtrans
-from likelihood.backbone_factory import FourierComplexBackbone
+from likelihood.backbone_factory import FourierComplexBackbone, ensure_srdtrans_repo_on_path
 from representation.fourier_pyramid import FourierPyramid2D, FourierPyramidCoefficients
+ensure_srdtrans_repo_on_path()
+from SRDTrans_v2.StructuredFourier import (
+    CrossScaleInjection, OrientationInteraction,
+)
 
 
 def config(representation, checkpoint=False, patch_x=64):
@@ -66,23 +71,50 @@ def run_structured(checkpoint):
     return model
 
 
+def check_native_attention():
+    torch.manual_seed(12)
+    orientation = OrientationInteraction(16, heads=4).eval()
+    tokens = torch.randn(9, 6, 16, dtype=torch.complex64)
+    bias = orientation.orientation_bias[orientation.relative_orientation_index]
+    generic = orientation.attn(tokens, tokens, tokens, attn_mask=bias)
+    x = rearrange(tokens, '(b t h w) o c -> b o c t h w', b=1, t=1, h=3, w=3)
+    expected = x + rearrange(generic, '(b t h w) o c -> b o c t h w',
+                             b=1, t=1, h=3, w=3)
+    assert torch.allclose(orientation(x), expected, atol=1e-6, rtol=1e-6)
+
+    lowpass = CrossScaleInjection(16, ratio=8, heads=4).eval()
+    trunk = torch.randn(1, 16, 2, 16, 16, dtype=torch.complex64)
+    branch = torch.randn(1, 1, 16, 2, 2, 2, dtype=torch.complex64)
+    q = rearrange(trunk, 'b c t (h rh) (w rw) -> (b t h w) (rh rw) c', rh=8, rw=8)
+    kv = rearrange(branch, 'b o c t h w -> (b t h w) o c')
+    reference = lowpass.attn(q, kv, kv)
+    reference = rearrange(reference, '(b t h w) (rh rw) c -> b c t (h rh) (w rw)',
+                          b=1, t=2, h=2, w=2, rh=8, rw=8)
+    assert torch.allclose(lowpass(trunk, branch), trunk + reference, atol=1e-6, rtol=1e-6)
+
+
 def run_gpu_full_smoke():
     cfg = config('steerable_fourier_structured')
     cfg.update(patch_t=128, srdtrans_f_maps=[24, 36, 48, 64], embedding_dim=128,
                num_heads=8, hidden_dim=384)
     model = build_denoise_network_srdtrans(cfg).cuda().train()
     x = torch.randn(1, 1, 128, 64, 64, device='cuda', requires_grad=True)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
     y = model(x)
     assert y.shape == x.shape and torch.isfinite(y).all() and not y.is_complex()
     y.square().mean().backward()
+    end.record()
+    torch.cuda.synchronize()
     assert all(p.grad is None or torch.isfinite(p.grad).all()
                for p in model.parameters())
-    print('CUDA 64x64x128 full-width forward/backward: PASS; peak_allocated_GiB={:.2f}'
-          .format(torch.cuda.max_memory_allocated() / 1024**3), flush=True)
+    print('CUDA 64x64x128 full-width forward/backward: PASS; ms={:.1f}; peak_allocated_GiB={:.2f}'
+          .format(start.elapsed_time(end), torch.cuda.max_memory_allocated() / 1024**3), flush=True)
 
 
 def main():
     torch.set_num_threads(2)
+    check_native_attention()
     coeffs = FourierPyramid2D(64)(torch.randn(1, 1, 2, 64, 64))
     assert coeffs.highpass.shape == (1, 1, 2, 64, 64)
     assert [tuple(x.shape) for x in coeffs.bands] == [
