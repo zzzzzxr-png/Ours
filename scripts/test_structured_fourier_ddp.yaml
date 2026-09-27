@@ -1,0 +1,27 @@
+backbone: srdtrans_v2
+representation: steerable_fourier_structured
+dtcwt_dim: 2
+dtcwt_levels: 3
+patch_x: 64
+patch_y: 64
+patch_t: 16
+srdtrans_f_maps: [16, 16, 16, 16]
+embedding_dim: 32
+num_heads: 4
+orientation_heads: 4
+hidden_dim: 64
+window_size: 7
+num_transBlock: 1
+attn_dropout_rate: 0.0
+input_dropout_rate: 0.0
+trans_order: st
+space_post_norm: false
+space_dropout_rate: 0.0
+use_msconv_before_trans: false
+skip_fusion: add
+interleaved_transformer: true
+space_attention: swin
+gradient_checkpointing: false
+checkpoint_transformer_only: false
+fourier_channel_normalize: false
+srdtrans_root: prior/srdtrans/SRDTrans_v2

@@ -230,8 +230,9 @@ def _build_transformer_protocol_model(cfg, ModelClass, label):
     return model
 
 
-def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
-    f_maps = list(getattr(cfg, 'srdtrans_f_maps', None) or [8, 16, 32, 64])
+def _build_srdtrans_v2_protocol_model(cfg, ModelClass, coefficient_channels=None,
+                                      f_maps_override=None):
+    f_maps = list(f_maps_override or getattr(cfg, 'srdtrans_f_maps', None) or [8, 16, 32, 64])
     trans_order = getattr(cfg, 'trans_order', 'ts')
     space_post_norm = bool(getattr(cfg, 'space_post_norm', False))
     space_dropout_rate = float(getattr(cfg, 'space_dropout_rate', 0.0))
@@ -239,10 +240,12 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass):
     levels = int(getattr(cfg, 'dtcwt_levels', 3))
     legacy_fourier = (getattr(cfg, 'representation', 'dtcwt') == 'steerable_fourier'
                       and bool(getattr(cfg, 'legacy_fourier_adapter', False)))
-    coefficient_dim = int(cfg.patch_x) if legacy_fourier else int(cfg.patch_x) // 2
-    coefficient_channels = (20 if legacy_fourier else
+    coefficient_dim = int(cfg.patch_x) if (legacy_fourier or
+                                             getattr(cfg, 'representation', 'dtcwt') ==
+                                             'steerable_fourier_structured') else int(cfg.patch_x) // 2
+    coefficient_channels = (coefficient_channels if coefficient_channels is not None else (20 if legacy_fourier else
                             (32 if getattr(cfg, 'representation', 'dtcwt') == 'steerable_fourier'
-                             else 2 + 6 * levels))
+                             else 2 + 6 * levels)))
     f_maps[0] = max(coefficient_channels, f_maps[0])
     for index in range(1, len(f_maps)):
         f_maps[index] = max(f_maps[index - 1], f_maps[index])
@@ -315,7 +318,7 @@ def build_denoise_network_srdtrans(cfg):
         SRDTrans_v2 = import_srdtrans_v2_class(getattr(cfg, 'srdtrans_root', None))
         representation = getattr(cfg, 'representation', 'dtcwt')
         dtcwt_dim = int(getattr(cfg, 'dtcwt_dim', 2))
-        if representation not in ('dtcwt', 'steerable_fourier'):
+        if representation not in ('dtcwt', 'steerable_fourier', 'steerable_fourier_structured'):
             raise ValueError('unknown SRDTrans_v2 representation {!r}'.format(
                 representation))
         # ponytail: 2D only; add a published differentiable 3D backend when requested.
@@ -324,6 +327,25 @@ def build_denoise_network_srdtrans(cfg):
         levels = int(getattr(cfg, 'dtcwt_levels', 3))
         legacy_fourier = (representation == 'steerable_fourier'
                           and bool(getattr(cfg, 'legacy_fourier_adapter', False)))
+        structured_fourier = representation == 'steerable_fourier_structured'
+        if structured_fourier:
+            if getattr(cfg, 'space_attention', 'swin') != 'swin':
+                raise ValueError('steerable_fourier_structured requires the existing Complex Swin attention')
+            from SRDTrans_v2.StructuredFourier import StructuredFourierComplexBackbone
+            f_maps = list(getattr(cfg, 'srdtrans_f_maps', None) or [8, 16, 32, 64])
+            backbone_model = _build_srdtrans_v2_protocol_model(
+                cfg, SRDTrans_v2, coefficient_channels=int(f_maps[0]),
+                f_maps_override=f_maps)
+            model = StructuredFourierComplexBackbone(
+                backbone_model, image_size=int(cfg.patch_x),
+                f_maps=list(backbone_model.f_maps),
+                orientation_heads=int(getattr(cfg, 'orientation_heads', 4)),
+                channel_normalize=bool(getattr(cfg, 'fourier_channel_normalize', True)),
+                channel_scales=getattr(cfg, 'fourier_channel_scales', None),
+            )
+            print('\033[1;31mStructured Fourier total params={:.2f}M\033[0m'.format(
+                sum(p.numel() for p in model.parameters()) / 1e6))
+            return model
         backbone_model = _build_srdtrans_v2_protocol_model(cfg, SRDTrans_v2)
         if representation == 'dtcwt':
             model = DTCWTComplexBackbone(

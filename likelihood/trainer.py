@@ -353,6 +353,7 @@ class training_class_srdtrans:
         self.srdtrans_root = DEFAULT_SRDTRANS_ROOT
         self.embedding_dim = 128
         self.num_heads = 8
+        self.orientation_heads = 4
         self.hidden_dim = 512
         self.window_size = 7
         self.num_transBlock = 1
@@ -556,6 +557,7 @@ class training_class_srdtrans:
             'train_datasets_size', 'overlap_factor', 'val_overlap_factor',
             'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'backbone',
             'representation', 'dtcwt_dim', 'dtcwt_levels', 'dtcwt_channel_normalize',
+            'orientation_heads',
             'legacy_fourier_adapter',
             'dtcwt_channel_scales', 'fourier_channel_normalize', 'fourier_channel_scales',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
@@ -1161,7 +1163,7 @@ class training_class_srdtrans:
                 ', '.join('{:.6f}'.format(value)
                           for value in self.dtcwt_channel_scales)
             ))
-        if self.representation == 'steerable_fourier' and self.fourier_channel_normalize:
+        if self.representation in ('steerable_fourier', 'steerable_fourier_structured') and self.fourier_channel_normalize:
             image_size = min(
                 int(self.patch_x),
                 min(int(stack.shape[-2]) for stack in self.train_noise_img),

@@ -31,7 +31,9 @@ def main():
                 broadcast_buffers=False)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     generator = torch.Generator(device='cuda').manual_seed(1024 + rank)
-    target = torch.randn((1, 1, 128, 128, 128), device='cuda', generator=generator)
+    target = torch.randn((1, 1, int(cfg['patch_t']), int(cfg['patch_x']),
+                          int(cfg.get('patch_y', cfg['patch_x']))),
+                         device='cuda', generator=generator)
     mask = torch.zeros_like(target)
     mask[..., ::20] = 1
     for step in range(3):
@@ -47,6 +49,9 @@ def main():
     norm = grad.detach().abs().mean()
     gathered = [torch.zeros_like(norm) for _ in range(2)]
     torch.distributed.all_gather(gathered, norm)
+    if not torch.allclose(gathered[0], gathered[1], rtol=1e-5, atol=1e-7):
+        raise RuntimeError('DDP gradients differ across ranks: {}'.format(
+            [float(value) for value in gathered]))
     if rank == 0:
         torch.save(model.module.state_dict(), '/tmp/ddp_srdtrans_smoke.pth')
         print('DDP smoke PASS: losses finite, gradients synchronized, checkpoint saved', flush=True)

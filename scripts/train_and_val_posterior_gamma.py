@@ -90,7 +90,7 @@ def parse_args():
                         help='Denoise backbone (all external backbones use 1ch, '
                              'trained from scratch under SRD protocol)')
     parser.add_argument('--representation', type=str, default='dtcwt',
-                        choices=['dtcwt', 'steerable_fourier'])
+                        choices=['dtcwt', 'steerable_fourier', 'steerable_fourier_structured'])
     parser.add_argument('--dtcwt_dim', type=int, default=2, choices=[2, 3])
     parser.add_argument('--dtcwt_levels', type=int, default=3)
     parser.add_argument('--dtcwt-channel-normalize', action='store_true',
@@ -114,6 +114,7 @@ def parse_args():
                         help='Path to the SRDTrans_v2 package or its parent.')
     parser.add_argument('--embedding-dim', type=int, default=128)
     parser.add_argument('--num-heads', type=int, default=8)
+    parser.add_argument('--orientation-heads', type=int, default=4)
     parser.add_argument('--hidden-dim', type=int, default=512)
     parser.add_argument('--window-size', type=int, default=7)
     parser.add_argument('--num-trans-block', type=int, default=1)
@@ -337,6 +338,7 @@ def main():
         'srdtrans_root': args.srdtrans_root,
         'embedding_dim': args.embedding_dim,
         'num_heads': args.num_heads,
+        'orientation_heads': args.orientation_heads,
         'hidden_dim': args.hidden_dim,
         'window_size': args.window_size,
         'num_transBlock': args.num_trans_block,
