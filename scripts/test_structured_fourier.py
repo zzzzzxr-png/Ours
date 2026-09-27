@@ -5,7 +5,7 @@ import os
 
 from likelihood.backbone_factory import build_denoise_network_srdtrans
 from likelihood.backbone_factory import FourierComplexBackbone
-from representation.fourier_pyramid import FourierPyramid2D
+from representation.fourier_pyramid import FourierPyramid2D, FourierPyramidCoefficients
 
 
 def config(representation, checkpoint=False, patch_x=64):
@@ -29,16 +29,20 @@ def run_structured(checkpoint):
     ).train()
     x = torch.randn(1, 1, 16, 64, 64, requires_grad=True)
     params = dict(model.named_parameters())
-    for head in (model.head.highpass, model.head.scale0, model.head.scale1,
-                 model.head.scale2, model.head.lowpass):
-        assert torch.count_nonzero(head.conv.weight) > 0
-        assert head.conv.bias is None or torch.count_nonzero(head.conv.bias) == 0
-
+    head_outputs = []
+    hook = model.head.register_forward_hook(lambda _module, _inputs, output: head_outputs.append(output))
     y = model(x)
+    hook.remove()
     assert y.shape == x.shape and not y.is_complex()
     assert torch.isfinite(y).all()
-    relative_initial_residual = (y - x).square().mean().sqrt() / x.square().mean().sqrt()
-    assert relative_initial_residual < 5e-2
+    assert len(head_outputs) == 1
+    source_coeffs = model.representation(x.detach())
+    outputs = head_outputs[0]
+    predicted = FourierPyramidCoefficients(
+        outputs[0], tuple(outputs[1:4]), outputs[4],
+        source_coeffs.spatial_size, source_coeffs.image_channels)
+    expected = model.representation.inverse(predicted)
+    assert torch.allclose(y, expected, atol=1e-5, rtol=1e-5)
     y.square().mean().backward()
     assert all(p.grad is None or torch.isfinite(p.grad).all()
                for p in model.parameters())
@@ -58,6 +62,7 @@ def run_structured(checkpoint):
                  'backbone.layers.0.space_regular.transformer.blocks.0.attn.qkv.linear.weight',
                  'head.scale0.conv.weight'):
         assert params[name].grad.abs().sum() > 0, name
+    assert not any(name.endswith('.gate') for name, _ in model.named_parameters())
     return model
 
 

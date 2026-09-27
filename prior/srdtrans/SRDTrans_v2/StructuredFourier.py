@@ -46,7 +46,6 @@ class OrientationInteraction(nn.Module):
             n_heads=heads, d_model=channels, d_k=channels // heads,
             d_v=channels // heads, dropout=dropout, softmax_on='real',
             residual_norm=False)
-        self.gate = nn.Parameter(torch.full((), 1e-3))
         self.register_buffer('relative_orientation_index', self._make_relative_index())
         self.orientation_bias = nn.Parameter(torch.zeros(4))
 
@@ -62,7 +61,7 @@ class OrientationInteraction(nn.Module):
         bias = self.orientation_bias[self.relative_orientation_index]
         y = self.attn(tokens, tokens, tokens, attn_mask=bias)
         y = rearrange(y, '(b t h w) o c -> b o c t h w', b=b, t=t, h=h, w=w)
-        return x + self.gate.to(x.real.dtype) * y
+        return x + y
 
 
 class TemporalBranchAlign(nn.Module):
@@ -98,7 +97,6 @@ class CrossScaleInjection(nn.Module):
             n_heads=heads, d_model=channels, d_k=channels // heads,
             d_v=channels // heads, dropout=0.0, softmax_on='real',
             residual_norm=False)
-        self.gate = nn.Parameter(torch.full((), 1e-3))
 
     def forward(self, trunk, branch):
         b, c, t, h, w = trunk.shape
@@ -114,7 +112,7 @@ class CrossScaleInjection(nn.Module):
         message = self.attn(q, kv, kv)
         message = rearrange(message, '(b t h w) (rh rw) c -> b c t (h rh) (w rw)',
                             b=b, t=t, h=h // r, w=w // r, rh=r, rw=r)
-        return trunk + self.gate.to(trunk.real.dtype) * message
+        return trunk + message
 
 
 class StructuredCoefficientHead(nn.Module):
@@ -125,11 +123,6 @@ class StructuredCoefficientHead(nn.Module):
         self.scale1 = cvnn.Conv3d(channels * 4, 6, 1)
         self.scale2 = cvnn.Conv3d(channels * 16, 6, 1)
         self.lowpass = cvnn.Conv3d(channels * 64, 1, 1)
-        for head in (self.highpass, self.scale0, self.scale1, self.scale2, self.lowpass):
-            with torch.no_grad():
-                head.conv.weight.mul_(1e-2)
-                if head.conv.bias is not None:
-                    nn.init.zeros_(head.conv.bias)
 
     @staticmethod
     def _pack(x, r):
@@ -233,11 +226,10 @@ class StructuredFourierComplexBackbone(nn.Module):
                 trunk = checkpoint(decoder, trunk, skip, use_reentrant=False)
             else:
                 trunk = decoder(trunk, skip)
-        deltas = self.head(trunk)
+        outputs = self.head(trunk)
         predicted = FourierPyramidCoefficients(
-            branches[0] + deltas[0],
-            tuple(branches[i + 1] + deltas[i + 1] for i in range(3)),
-            branches[-1] + deltas[-1], coeffs.spatial_size, coeffs.image_channels)
+            outputs[0], tuple(outputs[i + 1] for i in range(3)), outputs[-1],
+            coeffs.spatial_size, coeffs.image_channels)
         if self.channel_normalize:
             predicted = self._scale(predicted, inverse=True)
         return self.representation.inverse(predicted)
