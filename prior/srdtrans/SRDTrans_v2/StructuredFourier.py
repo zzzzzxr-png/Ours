@@ -1,5 +1,7 @@
 """Native-pyramid wrapper around the unchanged complex SRDTrans core."""
 
+import inspect
+
 import torch
 from einops import rearrange
 from torch import nn
@@ -13,17 +15,13 @@ def _complex_block(cin, cout):
     return nn.Sequential(cvnn.Conv3d(cin, cout, 1), ComplexRMSNorm3d(), cvnn.modReLU())
 
 
-class _AdditiveRealSoftmax(nn.Module):
-    """ComplexTorch 2.1.x lacks an attention-mask argument; add bias at softmax."""
-    def __init__(self):
-        super().__init__()
-        self.softmax = nn.Softmax(dim=-1)
-        self.bias = None
-
-    def forward(self, scores):
-        if self.bias is not None:
-            scores = scores + self.bias.to(device=scores.device, dtype=scores.dtype)
-        return self.softmax(scores)
+def _require_masked_complex_attention():
+    if ('residual_norm' not in inspect.signature(cvnn.MultiheadAttention).parameters
+            or 'attn_mask' not in inspect.signature(cvnn.MultiheadAttention.forward).parameters):
+        raise RuntimeError(
+            'steerable_fourier_structured requires ComplexTorch main (2.2.0 API) '
+            'with MultiheadAttention residual_norm and attn_mask support; '
+            'the installed package is too old')
 
 
 class SharedDirectionalEmbedding(nn.Module):
@@ -46,10 +44,9 @@ class OrientationInteraction(nn.Module):
                 channels, heads))
         self.attn = cvnn.MultiheadAttention(
             n_heads=heads, d_model=channels, d_k=channels // heads,
-            d_v=channels // heads, dropout=dropout, softmax_on='real')
-        self.attn.layer_norm = nn.Identity()
-        self.attn.attention.softmax = _AdditiveRealSoftmax()
-        self.gate = nn.Parameter(torch.zeros(()))
+            d_v=channels // heads, dropout=dropout, softmax_on='real',
+            residual_norm=False)
+        self.gate = nn.Parameter(torch.full((), 1e-3))
         self.register_buffer('relative_orientation_index', self._make_relative_index())
         self.orientation_bias = nn.Parameter(torch.zeros(4))
 
@@ -63,8 +60,7 @@ class OrientationInteraction(nn.Module):
         b, o, c, t, h, w = x.shape
         tokens = rearrange(x, 'b o c t h w -> (b t h w) o c')
         bias = self.orientation_bias[self.relative_orientation_index]
-        self.attn.attention.softmax.bias = bias[None, None]
-        y = self.attn(tokens, tokens, tokens) - tokens
+        y = self.attn(tokens, tokens, tokens, attn_mask=bias)
         y = rearrange(y, '(b t h w) o c -> b o c t h w', b=b, t=t, h=h, w=w)
         return x + self.gate.to(x.real.dtype) * y
 
@@ -100,9 +96,9 @@ class CrossScaleInjection(nn.Module):
         self.ratio = int(ratio)
         self.attn = cvnn.MultiheadAttention(
             n_heads=heads, d_model=channels, d_k=channels // heads,
-            d_v=channels // heads, dropout=0.0, softmax_on='real')
-        self.attn.layer_norm = nn.Identity()
-        self.gate = nn.Parameter(torch.zeros(()))
+            d_v=channels // heads, dropout=0.0, softmax_on='real',
+            residual_norm=False)
+        self.gate = nn.Parameter(torch.full((), 1e-3))
 
     def forward(self, trunk, branch):
         b, c, t, h, w = trunk.shape
@@ -115,7 +111,7 @@ class CrossScaleInjection(nn.Module):
                              .format(tuple(trunk.shape), tuple(branch.shape), r))
         q = rearrange(trunk, 'b c t (h rh) (w rw) -> (b t h w) (rh rw) c', rh=r, rw=r)
         kv = rearrange(branch, 'b o c t h w -> (b t h w) o c')
-        message = self.attn(q, kv, kv) - q
+        message = self.attn(q, kv, kv)
         message = rearrange(message, '(b t h w) (rh rw) c -> b c t (h rh) (w rw)',
                             b=b, t=t, h=h // r, w=w // r, rh=r, rw=r)
         return trunk + self.gate.to(trunk.real.dtype) * message
@@ -129,6 +125,11 @@ class StructuredCoefficientHead(nn.Module):
         self.scale1 = cvnn.Conv3d(channels * 4, 6, 1)
         self.scale2 = cvnn.Conv3d(channels * 16, 6, 1)
         self.lowpass = cvnn.Conv3d(channels * 64, 1, 1)
+        for head in (self.highpass, self.scale0, self.scale1, self.scale2, self.lowpass):
+            with torch.no_grad():
+                head.conv.weight.mul_(1e-2)
+                if head.conv.bias is not None:
+                    nn.init.zeros_(head.conv.bias)
 
     @staticmethod
     def _pack(x, r):
@@ -146,6 +147,7 @@ class StructuredFourierComplexBackbone(nn.Module):
     def __init__(self, backbone, image_size, f_maps, orientation_heads=4,
                  channel_normalize=True, channel_scales=None):
         super().__init__()
+        _require_masked_complex_attention()
         self.backbone = backbone
         self.representation = FourierPyramid2D(image_size=image_size, height=3, order=5)
         c0, c1, c2, c3 = map(int, f_maps)

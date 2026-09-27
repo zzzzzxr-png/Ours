@@ -45,6 +45,10 @@ def main():
         optimizer.step()
         if not torch.isfinite(loss):
             raise FloatingPointError('non-finite loss on rank {}'.format(rank))
+    if cfg.get('representation') == 'steerable_fourier_structured':
+        qkv_grad = model.module.orientation[0].attn.w_q.linear.weight.grad
+        if qkv_grad is None or qkv_grad.abs().sum() == 0:
+            raise RuntimeError('structured orientation QKV did not receive a nonzero gradient')
     grad = next(p.grad for p in model.parameters() if p.grad is not None)
     norm = grad.detach().abs().mean()
     gathered = [torch.zeros_like(norm) for _ in range(2)]
