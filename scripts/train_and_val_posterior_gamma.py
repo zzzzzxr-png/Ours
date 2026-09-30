@@ -40,6 +40,10 @@ def parse_args():
                         help='Ground-truth .tif for validation SNR')
     parser.add_argument('--pth_dir', type=str, default='./260615_experiments_srdtrans_protocol_unet',
                         help='Root directory for checkpoints')
+    parser.add_argument('--eval_only', action='store_true',
+                        help='Run one read-only pure-network validation and exit')
+    parser.add_argument('--init_ckpt', type=str, default='',
+                        help='Pure-network state_dict checkpoint for --eval_only')
 
     parser.add_argument('--patch_xy', type=int, default=128,
                         help='Patch size in x and y')
@@ -115,6 +119,10 @@ def parse_args():
     parser.add_argument('--embedding-dim', type=int, default=128)
     parser.add_argument('--num-heads', type=int, default=8)
     parser.add_argument('--orientation-heads', type=int, default=4)
+    parser.add_argument('--structured-orientation-interaction',
+                        choices=['attention', 'shared_mix'], default='attention')
+    parser.add_argument('--structured-cross-scale-interaction',
+                        choices=['attention', 'parent_child'], default='attention')
     parser.add_argument('--hidden-dim', type=int, default=512)
     parser.add_argument('--window-size', type=int, default=7)
     parser.add_argument('--num-trans-block', type=int, default=1)
@@ -134,6 +142,8 @@ def parse_args():
     parser.add_argument('--temporal_strides', type=str, default=None,
                         help='Comma-separated temporal strides for SRDTrans backbone '
                              '(e.g. 2,2,2,2); ignored for other backbones')
+    parser.add_argument('--compression-axis', choices=['time', 'space'], default='time',
+                        help='Axis downsampled by the SRDTrans encoder/decoder')
     parser.add_argument('--last_squeeze_op', type=str, default='conv',
                         choices=['conv', 'fold', 'local_attn'],
                         help='Downsampling operator for the last temporal SqueezeLayer only')
@@ -192,9 +202,11 @@ def parse_args():
         '--mask_loss',
         type=str,
         default='nll',
-        choices=['l1l2', 'nll'],
+        choices=['l1l2', 'nll', 'pn2v_pg'],
         help='Masked self-supervision loss: L1+L2 or Gamma-NB predictive NLL',
     )
+    parser.add_argument('--prior_samples', type=int, default=64,
+                        help='PN2V candidate count when --mask_loss=pn2v_pg')
     parser.add_argument(
         '--kappa_mode',
         type=str,
@@ -339,6 +351,8 @@ def main():
         'embedding_dim': args.embedding_dim,
         'num_heads': args.num_heads,
         'orientation_heads': args.orientation_heads,
+        'structured_orientation_interaction': args.structured_orientation_interaction,
+        'structured_cross_scale_interaction': args.structured_cross_scale_interaction,
         'hidden_dim': args.hidden_dim,
         'window_size': args.window_size,
         'num_transBlock': args.num_trans_block,
@@ -350,6 +364,7 @@ def main():
         'space_attention': args.space_attention,
         'checkpoint_transformer_only': args.checkpoint_transformer_only,
         'temporal_strides': temporal_strides,
+        'compression_axis': args.compression_axis,
         'last_squeeze_op': args.last_squeeze_op,
         'GPU': args.gpu,
         'batch_size': args.batch_size,
@@ -371,6 +386,7 @@ def main():
         'use_msconv_before_trans': args.use_msconv_before_trans,
         'gradient_checkpointing': args.gradient_checkpointing,
         'mask_loss': args.mask_loss,
+        'prior_samples': args.prior_samples,
         'kappa_mode': args.kappa_mode,
         'mpgn_alpha': args.mpgn_alpha,
         'mpgn_beta': args.mpgn_beta,
@@ -387,14 +403,21 @@ def main():
         'smoke_test_batch_candidates': args.smoke_test_batch_candidates,
         'smoke_test_memory_fraction': args.smoke_test_memory_fraction,
         'eval_ckpt': args.eval_ckpt,
+        'init_ckpt': args.init_ckpt,
+        'eval_only': args.eval_only,
     }
 
-    if args.pure_network:
+    if args.mask_loss == 'pn2v_pg':
+        tc = training_class_srdtrans(train_dict)
+    elif args.pure_network:
         train_dict['mask_loss'] = 'l1l2'
         tc = training_class_srdtrans(train_dict)
     else:
         tc = training_class_srdtrans_gamma(train_dict)
-    tc.run()
+    if args.pure_network and args.eval_only:
+        tc.run_eval_only()
+    else:
+        tc.run()
 
 
 if __name__ == '__main__':

@@ -6,6 +6,7 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from prior.deepcadrt import Network_3D_Unet
 from representation import (
@@ -114,9 +115,13 @@ class FourierComplexBackbone(nn.Module):
     """Real video -> complex steerable Fourier pyramid -> complex SRDTrans."""
 
     def __init__(self, backbone: nn.Module, image_size, image_channels=1,
-                 channel_normalize=True, channel_scales=None, legacy_adapter=False):
+                 channel_normalize=True, channel_scales=None, legacy_adapter=False,
+                 prior_samples=1):
         super().__init__()
         self.backbone = backbone
+        self.prior_samples = int(prior_samples)
+        if self.prior_samples < 1:
+            raise ValueError('prior_samples must be positive')
         self.representation = FourierPyramid2D(
             image_size=image_size, height=3, order=5,
             image_channels=image_channels,
@@ -135,6 +140,14 @@ class FourierComplexBackbone(nn.Module):
         else:
             scales = torch.ones(20, dtype=torch.float32)
         self.register_buffer('channel_scales', scales)
+        self.candidate_head = None
+        if self.prior_samples > 1:
+            # The legacy Fourier path has 20 complex coefficient channels.
+            # Keep the SRDTrans feature shape unchanged and decode candidates
+            # only after the existing inverse transform.
+            self.candidate_head = nn.Conv3d(41, self.prior_samples, kernel_size=1)
+            nn.init.normal_(self.candidate_head.weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.candidate_head.bias)
 
     def _scale_branches(self, coefficients, inverse=False):
         branches = (coefficients.highpass,) + coefficients.bands + (coefficients.lowpass,)
@@ -168,7 +181,30 @@ class FourierComplexBackbone(nn.Module):
         predicted = self.adapter.decode(predicted, coefficients)
         if self.channel_normalize:
             predicted = self._scale_branches(predicted, inverse=True)
-        return self.representation.inverse(predicted)
+        base = self.representation.inverse(predicted)
+        if self.candidate_head is None:
+            return base
+        predicted_branches = (
+            predicted.highpass, *predicted.bands, predicted.lowpass
+        )
+        target_hw = base.shape[-2:]
+        aligned_branches = []
+        for branch in predicted_branches:
+            if branch.shape[-2:] != target_hw:
+                shape = (branch.shape[0], branch.shape[1], branch.shape[2],
+                         target_hw[0], target_hw[1])
+                real = F.interpolate(branch.real, size=shape[2:], mode='nearest')
+                imag = F.interpolate(branch.imag, size=shape[2:], mode='nearest')
+                branch = torch.complex(real, imag)
+            aligned_branches.append(branch)
+        predicted_complex = torch.cat(aligned_branches, dim=1)
+        if predicted_complex.shape[1] != 20:
+            raise RuntimeError(
+                'PN2V candidate head expects 20 Fourier channels, got {}'.format(
+                    predicted_complex.shape[1]))
+        candidate_feature = torch.cat(
+            (predicted_complex.real, predicted_complex.imag, base), dim=1)
+        return base + self.candidate_head(candidate_feature)
 
 
 def ensure_srdtrans_repo_on_path(srdtrans_root=None):
@@ -269,6 +305,7 @@ def _build_srdtrans_v2_protocol_model(cfg, ModelClass, coefficient_channels=None
         skip_fusion=getattr(cfg, 'skip_fusion', 'add'),
         interleaved_transformer=bool(getattr(cfg, 'interleaved_transformer', False)),
         space_attention=getattr(cfg, 'space_attention', 'swin'),
+        compression_axis=getattr(cfg, 'compression_axis', 'time'),
     )
     model.gradient_checkpointing = bool(
         getattr(cfg, 'gradient_checkpointing', True)
@@ -342,6 +379,10 @@ def build_denoise_network_srdtrans(cfg):
                 orientation_heads=int(getattr(cfg, 'orientation_heads', 4)),
                 channel_normalize=bool(getattr(cfg, 'fourier_channel_normalize', True)),
                 channel_scales=getattr(cfg, 'fourier_channel_scales', None),
+                orientation_interaction=getattr(
+                    cfg, 'structured_orientation_interaction', 'attention'),
+                cross_scale_interaction=getattr(
+                    cfg, 'structured_cross_scale_interaction', 'attention'),
             )
             print('\033[1;31mStructured Fourier total params={:.2f}M\033[0m'.format(
                 sum(p.numel() for p in model.parameters()) / 1e6))
@@ -366,6 +407,8 @@ def build_denoise_network_srdtrans(cfg):
                 channel_normalize=bool(getattr(cfg, 'fourier_channel_normalize', True)),
                 channel_scales=getattr(cfg, 'fourier_channel_scales', None),
                 legacy_adapter=legacy_fourier,
+                prior_samples=(int(getattr(cfg, 'prior_samples', 1))
+                               if getattr(cfg, 'mask_loss', 'l1l2') == 'pn2v_pg' else 1),
             )
     else:
         raise ValueError(

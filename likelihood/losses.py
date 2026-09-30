@@ -46,6 +46,146 @@ def masked_l1_l2_loss(
     return float(l1_weight) * l1 + float(l2_weight) * l2
 
 
+def mpgn_pn2v_marginal_nll(
+    candidates,
+    target,
+    valid_mask,
+    pred_img_mean,
+    target_img_mean,
+    alpha,
+    beta,
+    offset=0.0,
+    kmax=512,
+    n_sigma=8.0,
+    quant_step=None,
+):
+    """PN2V particle-prior marginal NLL on masked voxels.
+
+    ``candidates`` is [B,K,T,H,W].  The likelihood is evaluated as
+    ``-logsumexp_k(log p(y|x_k)) + log(K)``.  Only masked voxels are materialized;
+    the photon-count support is local to each observation, so no
+    [B,K,T,H,W,kmax] tensor is constructed.
+    """
+    if candidates.ndim != 5 or target.ndim != 5 or valid_mask.ndim != 5:
+        raise ValueError('expected candidates [B,K,T,H,W], target/mask [B,1,T,H,W]')
+    if candidates.shape[0] != target.shape[0] or candidates.shape[2:] != target.shape[2:]:
+        raise ValueError('candidate and target shapes are incompatible')
+    if target.shape[1] != 1 or valid_mask.shape != target.shape:
+        raise ValueError('target and valid_mask must both be [B,1,T,H,W]')
+
+    dtype = candidates.dtype
+    device = candidates.device
+    mask = valid_mask.to(dtype=torch.bool)
+    mask4 = mask[:, 0]
+    batch_idx = mask4.nonzero(as_tuple=True)[0]
+    cand = candidates.permute(0, 2, 3, 4, 1)[mask4]
+    y = target[:, 0].to(dtype=dtype)[mask4]
+    if cand.numel() == 0:
+        return candidates.sum() * 0.0
+
+    mean_pred = torch.as_tensor(pred_img_mean, dtype=dtype, device=device)
+    mean_target = torch.as_tensor(target_img_mean, dtype=dtype, device=device)
+    pred_offset = mean_pred.reshape(-1)[batch_idx] if mean_pred.numel() > 1 else mean_pred.reshape(1)
+    target_offset = mean_target.reshape(-1)[batch_idx] if mean_target.numel() > 1 else mean_target.reshape(1)
+    x = cand + pred_offset[:, None]
+    y = y + target_offset
+    alpha_t = torch.as_tensor(float(alpha), dtype=dtype, device=device)
+    beta_t = torch.as_tensor(float(beta), dtype=dtype, device=device).clamp_min(1e-12)
+    offset_t = torch.as_tensor(float(offset), dtype=dtype, device=device)
+
+    std = torch.sqrt(beta_t)
+    radius = max(1, int(torch.ceil(
+        torch.as_tensor(float(n_sigma), device=device) * std / alpha_t
+    ).item()) + 2)
+    center = torch.round((y - offset_t) / alpha_t).to(torch.long)
+    offsets = torch.arange(-radius, radius + 1, device=device, dtype=torch.long)
+    low = (center - radius).clamp_min(0)
+    high = (center + radius).clamp_max(int(kmax))
+    k_int = low[:, None] + torch.arange(2 * radius + 1, device=device).long()[None, :]
+    valid_k = k_int <= high[:, None]
+    k = k_int.clamp_max(int(kmax)).to(dtype)
+
+    lam = ((x - offset_t) / alpha_t).clamp_min(1e-12)
+    log_pois = (
+        lam[:, :, None].log() * k[:, None, :]
+        - lam[:, :, None]
+        - torch.lgamma(k[:, None, :] + 1.0)
+    )
+    log_pois = log_pois.masked_fill(~valid_k[:, None, :], -torch.inf)
+    mu_k = offset_t + alpha_t * k
+    if quant_step is None:
+        log_obs = -0.5 * (
+            (y[:, None] - mu_k).square() / beta_t
+            + torch.log(2.0 * torch.pi * beta_t)
+        )
+    else:
+        half = float(quant_step) * 0.5
+        log_obs = _normal_log_interval_prob(
+            y[:, None] - half, y[:, None] + half, mu_k, std
+        )
+    log_lik = torch.logsumexp(log_pois + log_obs[:, None, :], dim=2)
+    log_marginal = torch.logsumexp(log_lik, dim=1) - math.log(candidates.shape[1])
+    return -log_marginal.mean()
+
+
+def mpgn_pn2v_posterior(
+    candidates, target, pred_img_mean, target_img_mean, alpha, beta,
+    offset=0.0, kmax=512, n_sigma=8.0, quant_step=None, chunk_size=32768,
+):
+    """Return particle posterior MMSE and ESS without materializing a k-volume."""
+    if candidates.ndim != 5 or target.ndim != 5 or target.shape[1] != 1:
+        raise ValueError('expected candidates [B,K,T,H,W], target [B,1,T,H,W]')
+    bsz, k_count = candidates.shape[:2]
+    flat_c = candidates.permute(0, 2, 3, 4, 1).reshape(-1, k_count)
+    flat_y = target[:, 0].reshape(-1)
+    batch_idx = torch.arange(bsz, device=candidates.device).view(bsz, 1, 1, 1)
+    batch_idx = batch_idx.expand(bsz, *candidates.shape[2:]).reshape(-1)
+    mean_pred = torch.as_tensor(pred_img_mean, dtype=candidates.dtype,
+                                device=candidates.device)
+    mean_target = torch.as_tensor(target_img_mean, dtype=candidates.dtype,
+                                  device=candidates.device)
+    alpha_t = torch.as_tensor(float(alpha), dtype=candidates.dtype, device=candidates.device)
+    beta_t = torch.as_tensor(float(beta), dtype=candidates.dtype,
+                             device=candidates.device).clamp_min(1e-12)
+    offset_t = torch.as_tensor(float(offset), dtype=candidates.dtype,
+                               device=candidates.device)
+    radius = max(1, int(torch.ceil(torch.as_tensor(float(n_sigma), device=candidates.device)
+                                   * torch.sqrt(beta_t) / alpha_t).item()) + 2)
+    out_mean, ess_sum = [], candidates.new_zeros(())
+    for start in range(0, flat_c.shape[0], int(chunk_size)):
+        end = min(start + int(chunk_size), flat_c.shape[0])
+        sample_idx = batch_idx[start:end]
+        pred_offset = mean_pred.reshape(-1)[sample_idx] if mean_pred.numel() > 1 else mean_pred.reshape(1)
+        target_offset = mean_target.reshape(-1)[sample_idx] if mean_target.numel() > 1 else mean_target.reshape(1)
+        x = flat_c[start:end] + pred_offset[:, None]
+        y = flat_y[start:end] + target_offset
+        center = torch.round((y - offset_t) / alpha_t).to(torch.long)
+        offsets = torch.arange(-radius, radius + 1, device=x.device, dtype=torch.long)
+        low = (center - radius).clamp_min(0)
+        high = (center + radius).clamp_max(int(kmax))
+        kk_int = low[:, None] + torch.arange(2 * radius + 1, device=x.device).long()[None, :]
+        valid_k = kk_int <= high[:, None]
+        kk = kk_int.clamp_max(int(kmax)).to(x.dtype)
+        lam = ((x - offset_t) / alpha_t).clamp_min(1e-12)
+        log_pois = (lam[:, :, None].log() * kk[:, None, :] - lam[:, :, None]
+                    - torch.lgamma(kk[:, None, :] + 1.0))
+        log_pois = log_pois.masked_fill(~valid_k[:, None, :], -torch.inf)
+        mu_k = offset_t + alpha_t * kk
+        if quant_step is None:
+            log_obs = -0.5 * ((y[:, None] - mu_k).square() / beta_t
+                              + torch.log(2.0 * torch.pi * beta_t))
+        else:
+            half = float(quant_step) * 0.5
+            log_obs = _normal_log_interval_prob(y[:, None] - half, y[:, None] + half,
+                                                mu_k, torch.sqrt(beta_t))
+        log_lik = torch.logsumexp(log_pois + log_obs[:, None, :], dim=2)
+        weights = torch.softmax(log_lik, dim=1)
+        out_mean.append((weights * flat_c[start:end]).sum(dim=1))
+        ess_sum = ess_sum + (1.0 / weights.square().sum(dim=1)).sum()
+    shape = (bsz, 1) + tuple(candidates.shape[2:])
+    return torch.cat(out_mean).reshape(shape), ess_sum / flat_c.shape[0]
+
+
 def _to_phys_units(x, img_mean):
     """Convert centered tensor back to acquisition/physical units."""
     if torch.is_tensor(img_mean):

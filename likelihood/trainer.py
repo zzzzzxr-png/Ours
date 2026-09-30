@@ -50,6 +50,8 @@ from .losses import (
     l1_l2_loss,
     masked_l1_l2_loss,
     mpgn_nll_single_target as _mpgn_nll_single_target,
+    mpgn_pn2v_marginal_nll as _mpgn_pn2v_marginal_nll,
+    mpgn_pn2v_posterior as _mpgn_pn2v_posterior,
 )
 from .masks import (
     _DIRECTIONAL_MASK_MEAN_MODES,
@@ -354,6 +356,8 @@ class training_class_srdtrans:
         self.embedding_dim = 128
         self.num_heads = 8
         self.orientation_heads = 4
+        self.structured_orientation_interaction = 'attention'
+        self.structured_cross_scale_interaction = 'attention'
         self.hidden_dim = 512
         self.window_size = 7
         self.num_transBlock = 1
@@ -364,6 +368,7 @@ class training_class_srdtrans:
         self.interleaved_transformer = False
         self.space_attention = 'swin'
         self.temporal_strides = None
+        self.compression_axis = 'time'
         self.last_squeeze_op = 'conv'
         self.freq_aware = False
         self.ftvsr_enc1 = False
@@ -376,6 +381,7 @@ class training_class_srdtrans:
         self.use_msconv_before_trans = False
         self.gradient_checkpointing = True
         self.mask_loss = 'l1l2'
+        self.prior_samples = 64
         self.mpgn_alpha = 5000.0
         self.mpgn_beta = 1600.0
         self.mpgn_offset = 0.0
@@ -558,17 +564,20 @@ class training_class_srdtrans:
             'val_process_frames', 'val_infer_frames', 'snr_margin', 'eval_every_iters', 'backbone',
             'representation', 'dtcwt_dim', 'dtcwt_levels', 'dtcwt_channel_normalize',
             'orientation_heads',
+            'structured_orientation_interaction', 'structured_cross_scale_interaction',
             'legacy_fourier_adapter',
             'dtcwt_channel_scales', 'fourier_channel_normalize', 'fourier_channel_scales',
             'srdtrans_root', 'embedding_dim', 'num_heads', 'hidden_dim', 'window_size',
             'num_transBlock', 'attn_dropout_rate',             'srdtrans_f_maps', 'input_dropout_rate',
             'skip_fusion', 'interleaved_transformer', 'space_attention',
-            'temporal_strides', 'last_squeeze_op', 'freq_aware', 'ftvsr_enc1', 'enc_d2', 'upsample_mode', 'init_ckpt',
+            'temporal_strides', 'compression_axis', 'last_squeeze_op',
+            'freq_aware', 'ftvsr_enc1', 'enc_d2', 'upsample_mode', 'init_ckpt',
             'sampling_mode',
             'mask_ratio', 'mask_min_dist', 'lattice_random_phase',
             'random_patch_coordinates', 'slice_axis', 'seed',
             'trans_order', 'space_post_norm', 'space_dropout_rate',
             'use_msconv_before_trans', 'gradient_checkpointing', 'mask_loss',
+            'prior_samples',
             'adaptive_grad_clip', 'grad_clip_warmup_iters',
             'grad_clip_percentile', 'grad_clip_warmup_cap',
             'grad_clip_median_multiplier',
@@ -716,7 +725,7 @@ class training_class_srdtrans:
             else:
                 # spatial / *_mask / *_mask_slice: full-resolution raw patch.
                 use_nll = (
-                    getattr(self, 'mask_loss', 'l1l2') == 'nll'
+                    getattr(self, 'mask_loss', 'l1l2') in ('nll', 'pn2v_pg')
                     and self.sampling_mode in _DIRECTIONAL_MASK_MODES
                 )
                 train_data = trainset_srdtrans(
@@ -767,7 +776,7 @@ class training_class_srdtrans:
                     total_loss = l1_l2_loss(noisy_output, tgt)
                 elif self.sampling_mode in _DIRECTIONAL_MASK_MODES:
                     stack_global_mean = None
-                    if getattr(self, 'mask_loss', 'l1l2') == 'nll':
+                    if getattr(self, 'mask_loss', 'l1l2') in ('nll', 'pn2v_pg'):
                         noisy, stack_global_mean = batch
                     else:
                         noisy = batch
@@ -812,7 +821,17 @@ class training_class_srdtrans:
                         )
 
                     noisy_output = self.local_model(masked_input)
-                    if getattr(self, 'mask_loss', 'l1l2') == 'nll':
+                    if getattr(self, 'mask_loss', 'l1l2') == 'pn2v_pg':
+                        patch_mean = stack_global_mean.view(-1, 1, 1, 1, 1)
+                        total_loss = _mpgn_pn2v_marginal_nll(
+                            noisy_output, masked_target, loss_mask,
+                            pred_img_mean=patch_mean, target_img_mean=patch_mean,
+                            alpha=self.mpgn_alpha, beta=self.mpgn_beta,
+                            offset=self.mpgn_offset,
+                            kmax=max(int(self.mpgn_kmax), 512),
+                            quant_step=getattr(self, 'mpgn_quant_step', 1.0),
+                        )
+                    elif getattr(self, 'mask_loss', 'l1l2') == 'nll':
                         patch_mean = stack_global_mean.view(-1, 1, 1, 1, 1)
                         total_loss = _mpgn_nll_single_target(
                             noisy_output,
@@ -997,6 +1016,9 @@ class training_class_srdtrans:
         time_start = time.time()
         denoise_img = np.zeros(noise_img.shape)
         denoise_before_match = np.zeros(noise_img.shape)
+        pn2v_mmse = np.zeros(noise_img.shape) if self.mask_loss == 'pn2v_pg' else None
+        pn2v_std_values = []
+        pn2v_ess_values = []
         input_img = np.zeros(noise_img.shape)
 
         test_data = testset_srdtrans(name_list, coordinate_list, noise_img)
@@ -1015,72 +1037,54 @@ class training_class_srdtrans:
                     noise_patch = noise_patch.cuda()
 
                 fake_B = self.local_model(noise_patch)
-                output_image = np.squeeze(fake_B.cpu().detach().numpy())
+                if self.mask_loss == 'pn2v_pg':
+                    prior_patch = fake_B.mean(dim=1, keepdim=True)
+                    post_mmse, posterior_ess = _mpgn_pn2v_posterior(
+                        fake_B, noise_patch, img_mean, img_mean,
+                        self.mpgn_alpha, self.mpgn_beta, self.mpgn_offset,
+                        kmax=max(int(self.mpgn_kmax), 512),
+                        quant_step=getattr(self, 'mpgn_quant_step', 1.0),
+                    )
+                    candidate_std = fake_B.std(dim=1)
+                    pn2v_std_values.append(candidate_std.detach().flatten().cpu())
+                    pn2v_ess_values.append(float(posterior_ess.detach().cpu()))
+                    output_tensors = (prior_patch, post_mmse)
+                else:
+                    output_tensors = (fake_B,)
                 raw_image = np.squeeze(noise_patch.cpu().detach().numpy())
 
-                batches_left = len(testloader) - iteration
-                prev_time = time.time()
-                print(
-                    '\r [Patch %d/%d] [Time Cost: %.0d s] [ETA: %.0d s]     '
-                    % (
-                        iteration + 1,
-                        len(testloader),
-                        time.time() - time_start,
-                        int(batches_left * (time.time() - prev_time)),
-                    ),
-                    end=' ',
-                )
-
-                if output_image.ndim == 3:
-                    postprocess_turn = 1
-                else:
-                    postprocess_turn = output_image.shape[0]
-
-                if postprocess_turn > 1:
-                    for batch_id in range(postprocess_turn):
+                for output_index, output_tensor in enumerate(output_tensors):
+                    output_image = np.squeeze(output_tensor.cpu().detach().numpy())
+                    target_volume = (denoise_before_match if output_index == 0
+                                     else pn2v_mmse)
+                    if output_image.ndim == 3:
+                        postprocess_turn = 1
+                    else:
+                        postprocess_turn = output_image.shape[0]
+                    if postprocess_turn > 1:
+                        for batch_id in range(postprocess_turn):
+                            output_patch, raw_patch, stack_start_w, stack_end_w, \
+                                stack_start_h, stack_end_h, stack_start_s, stack_end_s = \
+                                multibatch_test_save_srdtrans(
+                                    single_coordinate, batch_id, output_image, raw_image)
+                            output_patch = output_patch + img_mean
+                            raw_patch = raw_patch + img_mean
+                            if output_index == 0:
+                                denoise_img[stack_start_s:stack_end_s, stack_start_h:stack_end_h, stack_start_w:stack_end_w] = output_patch * (np.sum(raw_patch) / np.sum(output_patch)) ** 0.5
+                            target_volume[stack_start_s:stack_end_s, stack_start_h:stack_end_h, stack_start_w:stack_end_w] = output_patch
+                            input_img[stack_start_s:stack_end_s, stack_start_h:stack_end_h, stack_start_w:stack_end_w] = raw_patch
+                    else:
                         output_patch, raw_patch, stack_start_w, stack_end_w, \
                             stack_start_h, stack_end_h, stack_start_s, stack_end_s = \
-                            multibatch_test_save_srdtrans(
-                                single_coordinate, batch_id, output_image, raw_image)
+                            singlebatch_test_save_srdtrans(single_coordinate, output_image, raw_image)
                         output_patch = output_patch + img_mean
                         raw_patch = raw_patch + img_mean
-                        denoise_before_match[
-                            stack_start_s:stack_end_s,
-                            stack_start_h:stack_end_h,
-                            stack_start_w:stack_end_w,
-                        ] = output_patch
-                        denoise_img[
-                            stack_start_s:stack_end_s,
-                            stack_start_h:stack_end_h,
-                            stack_start_w:stack_end_w,
-                        ] = output_patch * (np.sum(raw_patch) / np.sum(output_patch)) ** 0.5
-                        input_img[
-                            stack_start_s:stack_end_s,
-                            stack_start_h:stack_end_h,
-                            stack_start_w:stack_end_w,
-                        ] = raw_patch
-                else:
-                    output_patch, raw_patch, stack_start_w, stack_end_w, \
-                        stack_start_h, stack_end_h, stack_start_s, stack_end_s = \
-                        singlebatch_test_save_srdtrans(
-                            single_coordinate, output_image, raw_image)
-                    output_patch = output_patch + img_mean
-                    raw_patch = raw_patch + img_mean
-                    denoise_before_match[
-                        stack_start_s:stack_end_s,
-                        stack_start_h:stack_end_h,
-                        stack_start_w:stack_end_w,
-                    ] = output_patch
-                    denoise_img[
-                        stack_start_s:stack_end_s,
-                        stack_start_h:stack_end_h,
-                        stack_start_w:stack_end_w,
-                    ] = output_patch * (np.sum(raw_patch) / np.sum(output_patch)) ** 0.5
-                    input_img[
-                        stack_start_s:stack_end_s,
-                        stack_start_h:stack_end_h,
-                        stack_start_w:stack_end_w,
-                    ] = raw_patch
+                        if output_index == 0:
+                            denoise_img[stack_start_s:stack_end_s, stack_start_h:stack_end_h, stack_start_w:stack_end_w] = output_patch * (np.sum(raw_patch) / np.sum(output_patch)) ** 0.5
+                        target_volume[stack_start_s:stack_end_s, stack_start_h:stack_end_h, stack_start_w:stack_end_w] = output_patch
+                        input_img[stack_start_s:stack_end_s, stack_start_h:stack_end_h, stack_start_w:stack_end_w] = raw_patch
+
+                print('\r [Patch %d/%d]' % (iteration + 1, len(testloader)), end=' ')
 
         print('\n', end=' ')
 
@@ -1099,6 +1103,20 @@ class training_class_srdtrans:
         snr_pre = cal_snr_srdtrans(output_pre[s:e], ref_img[s:e])
         snr_post = cal_snr_srdtrans(output_post[s:e], ref_img[s:e])
         snr_noisy = cal_snr_srdtrans(noisy_full[s:e], ref_img[s:e])
+        if self.mask_loss == 'pn2v_pg':
+            snr_mmse = cal_snr_srdtrans(pn2v_mmse[s:e], ref_img[s:e])
+            print('PN2V SNR noisy / prior_mean / posterior_mean / gain '
+                  '-----> {:.4f} / {:.4f} / {:.4f} / {:.4f} dB'.format(
+                      snr_noisy, snr_pre, snr_mmse, snr_mmse - snr_pre))
+            if pn2v_std_values:
+                std_values = torch.cat(pn2v_std_values).numpy()
+                print('PN2V candidate std mean/percentiles/fraction<1e-3: '
+                      '{:.6g} / {} / {:.6g}'.format(
+                          float(std_values.mean()),
+                          np.percentile(std_values, [5, 25, 50, 75, 95]).round(6).tolist(),
+                          float(np.mean(std_values < 1e-3))))
+                print('PN2V ESS mean/median: {:.6g} / {:.6g}'.format(
+                    float(np.mean(pn2v_ess_values)), float(np.median(pn2v_ess_values))))
         print(
             'SNR (frames {:d}:{:d} of first {:d}; infer_T={:d}; '
             'denoised_no_scale / denoised / noisy vs GT) '
@@ -1108,14 +1126,23 @@ class training_class_srdtrans:
         metrics_path = os.path.join(self.pth_path, 'val_metrics.md')
         if not os.path.exists(metrics_path):
             with open(metrics_path, 'w') as f:
-                f.write('| Epoch | Iteration | SNR_no_scale (dB) | SNR_denoised (dB) | SNR_noisy (dB) |\n')
-                f.write('| ----- | --------- | ----------------- | ----------------- | -------------- |\n')
+                if self.mask_loss == 'pn2v_pg':
+                    f.write('| epoch | noisy_snr | prior_mean_snr | posterior_mean_snr | posterior_gain |\n')
+                    f.write('| --- | ---: | ---: | ---: | ---: |\n')
+                else:
+                    f.write('| Epoch | Iteration | SNR_no_scale (dB) | SNR_denoised (dB) | SNR_noisy (dB) |\n')
+                    f.write('| ----- | --------- | ----------------- | ----------------- | -------------- |\n')
         with open(metrics_path, 'a') as f:
-            f.write('| {} | {} | {:.4f} | {:.4f} | {:.4f} |\n'.format(
-                train_epoch + 1, train_iteration + 1, snr_pre, snr_post, snr_noisy))
+            if self.mask_loss == 'pn2v_pg':
+                f.write('| {} | {:.4f} | {:.4f} | {:.4f} | {:.4f} |\n'.format(
+                    train_epoch + 1, snr_noisy, snr_pre, snr_mmse, snr_mmse - snr_pre))
+            else:
+                f.write('| {} | {} | {:.4f} | {:.4f} | {:.4f} |\n'.format(
+                    train_epoch + 1, train_iteration + 1, snr_pre, snr_post, snr_noisy))
 
         if self.save_test_images_per_epoch:
-            save_img = output_post[s:e]
+            save_img = (pn2v_mmse[s:e] if self.mask_loss == 'pn2v_pg'
+                        else output_post[s:e])
             if input_data_type == 'uint16':
                 save_img = np.clip(save_img, 0, 65535).astype('uint16')
             elif input_data_type == 'int16':
@@ -1134,7 +1161,22 @@ class training_class_srdtrans:
                     str(train_iteration + 1).zfill(4),
                 ),
             )
-            io.imsave(result_name, save_img, check_contrast=False)
+            prior_img = output_pre[s:e]
+            if input_data_type == 'uint16':
+                prior_img = np.clip(prior_img, 0, 65535).astype('uint16')
+            elif input_data_type == 'int16':
+                prior_img = np.clip(prior_img, -32767, 32767).astype('int16')
+            else:
+                prior_img = prior_img.astype('int32')
+            if self.mask_loss == 'pn2v_pg':
+                posterior_mean_name = result_name.replace('_E_', '_posterior_mean_E_')
+                prior_mean_name = result_name.replace('_E_', '_prior_mean_E_')
+                io.imsave(posterior_mean_name, save_img, check_contrast=False)
+                io.imsave(prior_mean_name, prior_img, check_contrast=False)
+            else:
+                io.imsave(result_name, save_img, check_contrast=False)
+                prior_name = result_name.replace('_E_', '_prior_E_')
+                io.imsave(prior_name, prior_img, check_contrast=False)
 
     def run(self):
         _bind_visible_gpu(str(self.GPU))
@@ -1188,6 +1230,26 @@ class training_class_srdtrans:
         if not self.no_resume:
             self._try_resume_checkpoint()
         self.train()
+
+    def run_eval_only(self):
+        """Prepare the model, load one checkpoint, and run validation once."""
+        _bind_visible_gpu(str(self.GPU))
+        self.prepare_file()
+        train_args = self._args_proxy()
+        train_args.sampling_mode = self.sampling_mode
+        (
+            self.train_name_list, self.train_noise_img, self.train_coordinate_list,
+            self.train_stack_index, self.train_stack_means,
+        ) = train_preprocess_lessMemoryMulStacks_srdtrans(train_args)
+        if self.representation in ('steerable_fourier', 'steerable_fourier_structured') and self.fourier_channel_normalize:
+            image_size = min(int(self.patch_x), *(int(s.shape[-1]) for s in self.train_noise_img))
+            self.fourier_channel_scales = _estimate_fixed_fourier_channel_scales(
+                self.train_noise_img, image_size // 16 * 16
+            )
+        self.initialize_network()
+        self.distribute_GPU()
+        self._load_init_ckpt(self.init_ckpt)
+        self.test(-1, 0)
 
 
 # Backward-compatible alias used by train_and_val_srdtrans.py
